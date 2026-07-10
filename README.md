@@ -25,7 +25,7 @@ It posts **inline comments on the exact defective lines** with severity tags, co
 
    jobs:
      review:
-       # Only review substantial changes (5+ files OR 20+ changed lines)
+       # Only review substantial changes (5+ files, or 20+ additions, or 20+ deletions)
        if: |
          github.event.pull_request.changed_files >= 5 ||
          github.event.pull_request.additions >= 20 ||
