@@ -15,6 +15,16 @@ on:
         description: Repo-specific review instructions appended to the base prompt
         type: string
         default: ""
+      upload_transcript:
+        description: >-
+          Persist the agent's turn-by-turn execution log as a workflow artifact.
+          claude-code-action does not write model turns to the workflow log, so
+          without this an anomalous review (see issue #3) is forensic rather
+          than diagnosable. The artifact inherits the caller repo's visibility
+          and contains the PR diff plus any repo file the reviewer opened — set
+          false where that is not acceptable.
+        type: boolean
+        default: true
     secrets:
       ZHIPU_API_KEY:
         required: true
@@ -27,11 +37,26 @@ jobs:
   review:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # No `id-token: write`. The reviewer never mints an OIDC token: it passes an
+    # explicit `github_token` below, and claude-code-action's setupGitHubToken()
+    # returns that token immediately instead of running the OIDC → App-token
+    # exchange. Its only other OIDC path is workload identity federation, which
+    # is gated on ANTHROPIC_FEDERATION_RULE_ID + ANTHROPIC_ORGANIZATION_ID —
+    # neither is set here, and the static ANTHROPIC_AUTH_TOKEN would take
+    # precedence anyway. Callers cannot drop the grant while this job declares
+    # it, because GitHub fails the run when a caller grants less than the called
+    # job requests. See issue #2.
+    #
+    # `issues: write` is retained deliberately. PR-level comments go through the
+    # /issues/{n}/comments endpoint, so it is plausibly redundant with
+    # `pull-requests: write` — but that has not been confirmed against a live
+    # run, and getting it wrong silently breaks the summary comment in every
+    # calling repo. Tracked in issue #3; remove only after a test proves
+    # `gh pr comment` still lands without it.
     permissions:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -40,6 +65,7 @@ jobs:
           persist-credentials: false
 
       - name: GLM bug-hunting review
+        id: review
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1
         env:
           ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
@@ -127,3 +153,22 @@ jobs:
             --max-turns 40
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
             --disallowedTools "WebSearch,WebFetch,Write,Edit,NotebookEdit,Bash(git add:*),Bash(git commit:*),Bash(git rm:*)"
+
+      # The workflow log records tool invocations but not the model's turns, so
+      # a run that posts something other than a review (issue #3) leaves no
+      # record of what produced it. claude-code-action writes the full message
+      # stream to $RUNNER_TEMP/claude-execution-output.json and exposes the path
+      # as the `execution_file` output; keeping it makes the next occurrence
+      # diagnosable instead of forensic.
+      #
+      # `always()` on purpose: the run that motivated this reported success.
+      # Failures need the transcript too, so this must not be conditioned on the
+      # review step's outcome.
+      - name: Upload review transcript
+        if: always() && inputs.upload_transcript && steps.review.outputs.execution_file != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: glm-review-transcript-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.review.outputs.execution_file }}
+          if-no-files-found: ignore
+          retention-days: 14

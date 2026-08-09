@@ -18,6 +18,5 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write
     secrets:
       ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
