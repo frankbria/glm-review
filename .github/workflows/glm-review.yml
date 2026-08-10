@@ -1,0 +1,39 @@
+name: GLM Review
+
+# This repo reviews its own pull requests with the reviewer it ships. Kept in
+# sync with caller.yml — the canonical example handed to consuming repos — with
+# one deliberate difference, below.
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths-ignore:
+      - "**/*.md"
+      - ".gitignore"
+
+jobs:
+  review:
+    # Only review substantial changes (5+ files, or 20+ additions, or 20+ deletions)
+    if: |
+      github.event.pull_request.changed_files >= 5 ||
+      github.event.pull_request.additions >= 20 ||
+      github.event.pull_request.deletions >= 20
+    # Local path, not `frankbria/glm-review/.github/workflows/review.yml@main`
+    # as consuming repos use. A local call resolves against the caller's own
+    # commit, so a PR here is reviewed by the review.yml *in that PR* rather
+    # than by the copy already on main. That is the point of reviewing
+    # ourselves: a change to the reviewer gets exercised before it merges and
+    # ships to the repos that track @main. It also keeps the permissions block
+    # below honest — pinning @main would require granting whatever main
+    # currently declares, since GitHub fails a run whose caller grants less
+    # than the called job requests.
+    #
+    # Consequence to know about: a PR that breaks review.yml breaks its own
+    # review. That is the desired failure mode — better here than downstream.
+    uses: ./.github/workflows/review.yml
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    secrets:
+      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
