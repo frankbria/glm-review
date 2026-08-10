@@ -47,16 +47,24 @@ jobs:
     # it, because GitHub fails the run when a caller grants less than the called
     # job requests. See issue #2.
     #
-    # `issues: write` is retained deliberately. PR-level comments go through the
-    # /issues/{n}/comments endpoint, so it is plausibly redundant with
-    # `pull-requests: write` — but that has not been confirmed against a live
-    # run, and getting it wrong silently breaks the summary comment in every
-    # calling repo. Tracked in issue #3; remove only after a test proves
-    # `gh pr comment` still lands without it.
+    # No `issues: write` either. The reviewer only ever comments on pull
+    # requests. Those comments go through /issues/{n}/comments — the endpoint is
+    # shared — but the permission GitHub checks is chosen by what the number
+    # resolves to, and for a PR that is `pull-requests`. This was the last
+    # unverified grant in issue #3, and it is verified the only way it can be:
+    # this repo reviews its own pull requests, so the change removing the grant
+    # was itself reviewed by a job running without it.
+    #
+    # This covers both comment paths, not just the summary: track_progress
+    # creates the tracking comment via issues.createComment and rewrites it via
+    # issues.updateComment, and the final verdict is folded into that same
+    # comment. If any of it needed `issues: write`, the review would not post.
+    #
+    # Re-add only for a trigger that touches real issues (an issue_comment or
+    # issues event), which this workflow does not have.
     permissions:
       contents: read
       pull-requests: write
-      issues: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
