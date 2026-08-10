@@ -35,10 +35,15 @@ It posts **inline comments on the exact defective lines** with severity tags, co
          contents: read
          pull-requests: write
          issues: write
-         id-token: write
        secrets:
          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
    ```
+
+   > `id-token: write` is **not** required and should not be granted. The reviewer
+   > passes an explicit `github_token`, so `claude-code-action` never performs the
+   > OIDC → App-token exchange. Existing callers that still grant it keep working
+   > (a caller may grant more than the called job requests), but it is dead
+   > privilege — drop it on the next edit.
 
 ## Options
 
@@ -46,6 +51,7 @@ It posts **inline comments on the exact defective lines** with severity tags, co
 |-------|---------|---------|
 | `model` | `glm-5.2` | GLM model id on the z.ai Anthropic-compatible endpoint |
 | `extra_instructions` | *(empty)* | Repo-specific review instructions appended to the base prompt |
+| `upload_transcript` | `true` | Keep the agent's turn-by-turn execution log as a 14-day workflow artifact |
 
 ```yaml
        uses: frankbria/glm-review/.github/workflows/review.yml@main
@@ -59,5 +65,6 @@ It posts **inline comments on the exact defective lines** with severity tags, co
 ## How it works
 
 - `review.yml` runs `anthropics/claude-code-action` with `ANTHROPIC_BASE_URL` pointed at `https://api.z.ai/api/anthropic`, so all usage bills to the GLM coding plan — no Anthropic charges.
-- Inline comments use the action's built-in `github_inline_comment` MCP tool; the model is restricted to read-only `gh pr` commands otherwise.
+- Inline comments use the action's built-in `github_inline_comment` MCP tool; the model is restricted to read-only `gh pr` commands otherwise. `--allowedTools` is *additive* to the action's own defaults rather than a replacement for them, so the write verbs it silently re-adds (`Write`, `Edit`, `git add|commit|rm`) are denied explicitly via `--disallowedTools`.
+- Each run uploads its execution transcript as a workflow artifact (`glm-review-transcript-<run>`, 14-day retention). The workflow log records tool calls but not model turns, so this is the only record of *why* a review said what it said. The artifact inherits the calling repo's visibility and contains the PR diff plus any file the reviewer opened — set `upload_transcript: false` where that is not acceptable.
 - The review prompt lives inline in [`.github/workflows/review.yml`](.github/workflows/review.yml) — edit it there and every consuming repo picks up the change (callers pin `@main`).
