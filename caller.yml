@@ -17,6 +17,5 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      issues: write
     secrets:
       ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}

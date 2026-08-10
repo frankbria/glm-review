@@ -34,16 +34,16 @@ It posts **inline comments on the exact defective lines** with severity tags, co
        permissions:
          contents: read
          pull-requests: write
-         issues: write
        secrets:
          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
    ```
 
-   > `id-token: write` is **not** required and should not be granted. The reviewer
-   > passes an explicit `github_token`, so `claude-code-action` never performs the
-   > OIDC → App-token exchange. Existing callers that still grant it keep working
-   > (a caller may grant more than the called job requests), but it is dead
-   > privilege — drop it on the next edit.
+   > Those two permissions are the whole set. Neither `id-token: write` nor
+   > `issues: write` is required — the reviewer passes an explicit `github_token`
+   > so the OIDC → App-token exchange never runs, and it only ever comments on
+   > pull requests, which `pull-requests: write` covers. Existing callers that
+   > still grant either keep working (a caller may grant more than the called job
+   > requests), but both are dead privilege — drop them on the next edit.
 
 ## Options
 
