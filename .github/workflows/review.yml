@@ -82,9 +82,10 @@ jobs:
         id: review
         # Shorter than the job timeout on purpose: a step timeout marks the step
         # failed and lets the rest of the job run, so the failure notice below
-        # still posts. Sized for the 80-turn cap above — a 40-turn review took
-        # 14 minutes, so 30 leaves the turn cap as the limit that normally binds
-        # and this as the catch for a genuinely hung API call.
+        # still posts. Sized above the turn cap rather than beside it, which is
+        # the whole point — turns cost ~22s each here (a 40-turn run took 14m, an
+        # 80-turn run was still going at 30m), so the 60-turn cap lands around
+        # 22m and this is the catch for a hang, not a second limit racing it.
         timeout-minutes: 30
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1
         env:
@@ -170,7 +171,7 @@ jobs:
           # way. See issue #3.
           claude_args: |
             --model ${{ inputs.model }}
-            --max-turns 80
+            --max-turns 60
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
             --disallowedTools "WebSearch,WebFetch,Write,Edit,NotebookEdit,Bash(git add:*),Bash(git commit:*),Bash(git rm:*)"
 
@@ -257,9 +258,23 @@ jobs:
           # The tracking comment carries a link to this run, which is what makes
           # it identifiable: the PR may hold stubs from earlier runs, and those
           # are not ours to rewrite.
-          comment_id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
-            | jq -rs --arg needle "/actions/runs/$GITHUB_RUN_ID" \
-                'flatten | map(select(.user.type == "Bot" and (.body | contains($needle)))) | last | .id // empty')"
+          comments="${RUNNER_TEMP:-.}/glm-review-comments.json"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            | jq -s 'flatten' > "$comments"
+          comment_id="$(jq -r --arg needle "/actions/runs/$GITHUB_RUN_ID" \
+            'map(select(.user.type == "Bot" and (.body | contains($needle)))) | last | .id // empty' \
+            "$comments")"
+
+          # A failed step does not mean no review. claude-code-action's SDK loop
+          # documents a pull_request-specific case where the iterator stays open
+          # after the result message, so the agent posts its verdict and the step
+          # is then killed on the clock. Overwriting that with "no review was
+          # produced" would destroy the very thing this notice exists to protect.
+          if [ -n "$comment_id" ] && jq -e --argjson id "$comment_id" \
+              'map(select(.id == $id)) | last | .body | test("Claude finished")' "$comments" >/dev/null; then
+            echo "Tracking comment $comment_id already carries the agent's verdict; leaving it alone."
+            exit 0
+          fi
 
           if [ -n "$comment_id" ]; then
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F "body=@$notice" >/dev/null
