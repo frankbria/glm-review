@@ -240,21 +240,6 @@ jobs:
           esac
           echo "Review did not complete (outcome=$OUTCOME, result=${subtype:-none}): $reason"
 
-          notice="${RUNNER_TEMP:-.}/glm-review-notice.md"
-          cat > "$notice" <<EOF
-          ### ⚠️ GLM review did not complete
-
-          No review was produced for this commit. **This is not a clean bill of
-          health** — it is the absence of one. A review that ran and found
-          nothing says so explicitly ("✅ GLM review: no defects found.").
-
-          Reason: $reason.
-
-          [View job run]($run_url) — the agent transcript is attached there as a
-          \`glm-review-transcript-*\` artifact when the agent got far enough to
-          write one.
-          EOF
-
           # The tracking comment carries a link to this run, which is what makes
           # it identifiable: the PR may hold stubs from earlier runs, and those
           # are not ours to rewrite.
@@ -264,17 +249,44 @@ jobs:
           comment_id="$(jq -r --arg needle "/actions/runs/$GITHUB_RUN_ID" \
             'map(select(.user.type == "Bot" and (.body | contains($needle)))) | last | .id // empty' \
             "$comments")"
-
-          # A failed step does not mean no review. claude-code-action's SDK loop
-          # documents a pull_request-specific case where the iterator stays open
-          # after the result message, so the agent posts its verdict and the step
-          # is then killed on the clock. Overwriting that with "no review was
-          # produced" would destroy the very thing this notice exists to protect.
-          if [ -n "$comment_id" ] && jq -e --argjson id "$comment_id" \
-              'map(select(.id == $id)) | last | .body | test("Claude finished")' "$comments" >/dev/null; then
-            echo "Tracking comment $comment_id already carries the agent's verdict; leaving it alone."
-            exit 0
+          prior=""
+          if [ -n "$comment_id" ]; then
+            prior="$(jq -r --argjson id "$comment_id" \
+              'map(select(.id == $id)) | last | .body // ""' "$comments")"
           fi
+
+          notice="${RUNNER_TEMP:-.}/glm-review-notice.md"
+          {
+            cat <<EOF
+          ### ⚠️ GLM review did not complete
+
+          This run did not finish, so there is no verdict for this commit.
+          **That is not the same as a clean bill of health** — a review that ran
+          and found nothing says so explicitly ("✅ GLM review: no defects
+          found.").
+
+          Reason: $reason.
+
+          [View job run]($run_url) — the agent transcript is attached there as a
+          \`glm-review-transcript-*\` artifact when the agent got far enough to
+          write one.
+          EOF
+
+            # Whatever the comment already held is folded in rather than
+            # discarded. A run can post findings into this comment and *then* be
+            # killed — the pinned action documents a pull_request case where its
+            # message loop hangs after the result message — and nothing in the
+            # step outcome distinguishes that from an untouched stub. Both
+            # candidate markers were checked and neither works: the action's
+            # "Claude finished" header is written from a `finally` block that a
+            # kill skips (and reads "Claude encountered an error" on any
+            # non-success subtype), while the stub's spinner survives the agent's
+            # own rewrites. So do not classify — keep it, collapsed, so the
+            # visible state is the notice and nothing is destroyed.
+            if [ -n "$prior" ] && ! printf '%s' "$prior" | grep -qF 'GLM review did not complete'; then
+              printf '\n<details><summary>What this comment held when the run stopped</summary>\n\n%s\n\n</details>\n' "$prior"
+            fi
+          } > "$notice"
 
           if [ -n "$comment_id" ]; then
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F "body=@$notice" >/dev/null
