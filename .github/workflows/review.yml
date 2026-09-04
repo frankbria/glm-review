@@ -36,7 +36,13 @@ concurrency:
 jobs:
   review:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Outer backstop only — the review step below carries its own, shorter
+    # timeout, and that is the one meant to fire. A *job* timeout cancels the
+    # remaining steps even when they declare `if: always()` — the transcript
+    # upload logged `skipped` on the 20m kill reported in
+    # frankbria/codeframe#1167 — which would take the failure notice down with
+    # it. Keep this comfortably above the step timeout so it never wins.
+    timeout-minutes: 35
     # No `id-token: write`. The reviewer never mints an OIDC token: it passes an
     # explicit `github_token` below, and claude-code-action's setupGitHubToken()
     # returns that token immediately instead of running the OIDC → App-token
@@ -74,6 +80,12 @@ jobs:
 
       - name: GLM bug-hunting review
         id: review
+        # Shorter than the job timeout on purpose: a step timeout marks the step
+        # failed and lets the rest of the job run, so the failure notice below
+        # still posts. Sized for the 80-turn cap above — a 40-turn review took
+        # 14 minutes, so 30 leaves the turn cap as the limit that normally binds
+        # and this as the catch for a genuinely hung API call.
+        timeout-minutes: 30
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1
         env:
           ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
@@ -158,7 +170,7 @@ jobs:
           # way. See issue #3.
           claude_args: |
             --model ${{ inputs.model }}
-            --max-turns 40
+            --max-turns 80
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
             --disallowedTools "WebSearch,WebFetch,Write,Edit,NotebookEdit,Bash(git add:*),Bash(git commit:*),Bash(git rm:*)"
 
@@ -180,3 +192,79 @@ jobs:
           path: ${{ steps.review.outputs.execution_file }}
           if-no-files-found: ignore
           retention-days: 14
+
+      # A review that does not finish must not leave the PR claiming one is in
+      # progress. `track_progress` posts a tracking comment before the agent
+      # starts and rewrites it with the findings when the agent finishes; when
+      # the agent never finishes, nothing rewrites it, so the PR shows an
+      # unchecked checklist and a spinner indefinitely. Downstream that read as
+      # a review permanently in flight (frankbria/codeframe#1167) — and, worse,
+      # indistinguishable from a review that ran and found nothing.
+      #
+      # Keyed off the step outcome rather than job status, which is why the
+      # review step above has its own shorter timeout: on a job-level timeout
+      # this step would be cancelled along with everything else.
+      - name: Report an incomplete review
+        if: always() && steps.review.outcome != 'success' && github.event.pull_request.number
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+          OUTCOME: ${{ steps.review.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          # The agent's own verdict, when it got far enough to write one. The
+          # file is a JSON array of messages; `-s | flatten` also copes if it is
+          # ever emitted one object per line.
+          subtype=""
+          if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+            subtype="$(jq -rs 'flatten | map(select(.type == "result")) | last | .subtype // empty' \
+              "$EXECUTION_FILE" 2>/dev/null || true)"
+          fi
+
+          case "$subtype" in
+            error_max_turns)
+              reason="the agent hit its turn cap (\`--max-turns\`) before it finished reviewing" ;;
+            error_during_execution)
+              reason="the agent errored part-way through the review" ;;
+            success)
+              reason="the agent finished but the step failed afterwards — see the log" ;;
+            "")
+              reason="the step was killed before the agent wrote a result — the 30-minute step timeout, or a hung API call" ;;
+            *)
+              reason="the agent stopped with \`$subtype\`" ;;
+          esac
+          echo "Review did not complete (outcome=$OUTCOME, result=${subtype:-none}): $reason"
+
+          notice="${RUNNER_TEMP:-.}/glm-review-notice.md"
+          cat > "$notice" <<EOF
+          ### ⚠️ GLM review did not complete
+
+          No review was produced for this commit. **This is not a clean bill of
+          health** — it is the absence of one. A review that ran and found
+          nothing says so explicitly ("✅ GLM review: no defects found.").
+
+          Reason: $reason.
+
+          [View job run]($run_url) — the agent transcript is attached there as a
+          \`glm-review-transcript-*\` artifact when the agent got far enough to
+          write one.
+          EOF
+
+          # The tracking comment carries a link to this run, which is what makes
+          # it identifiable: the PR may hold stubs from earlier runs, and those
+          # are not ours to rewrite.
+          comment_id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            | jq -rs --arg needle "/actions/runs/$GITHUB_RUN_ID" \
+                'flatten | map(select(.user.type == "Bot" and (.body | contains($needle)))) | last | .id // empty')"
+
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F "body=@$notice" >/dev/null
+            echo "Replaced tracking comment $comment_id with the failure notice."
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F "body=@$notice" >/dev/null
+            echo "No tracking comment for this run; posted the failure notice as a new comment."
+          fi
