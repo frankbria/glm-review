@@ -42,7 +42,7 @@ jobs:
     # upload logged `skipped` on the 20m kill reported in
     # frankbria/codeframe#1167 — which would take the failure notice down with
     # it. Keep this comfortably above the step timeout so it never wins.
-    timeout-minutes: 35
+    timeout-minutes: 40
     # No `id-token: write`. The reviewer never mints an OIDC token: it passes an
     # explicit `github_token` below, and claude-code-action's setupGitHubToken()
     # returns that token immediately instead of running the OIDC → App-token
@@ -83,10 +83,11 @@ jobs:
         # Shorter than the job timeout on purpose: a step timeout marks the step
         # failed and lets the rest of the job run, so the failure notice below
         # still posts. Sized above the turn cap rather than beside it, which is
-        # the whole point — turns cost ~22s each here (a 40-turn run took 14m, an
-        # 80-turn run was still going at 30m), so the 60-turn cap lands around
-        # 22m and this is the catch for a hang, not a second limit racing it.
-        timeout-minutes: 30
+        # the whole point. Measured on this repo's own PRs, a 60-turn review ran
+        # 14m10s and 25m13s — same cap, same repo, 11 minutes apart — so the
+        # spread, not the mean, is what this has to clear. 35 leaves the turn cap
+        # binding on a slow run and keeps this as the catch for a hang.
+        timeout-minutes: 35
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1
         env:
           ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
@@ -234,7 +235,7 @@ jobs:
             success)
               reason="the agent finished but the step failed afterwards — see the log" ;;
             "")
-              reason="the step was killed before the agent wrote a result — the 30-minute step timeout, or a hung API call" ;;
+              reason="the step was killed before the agent wrote a result — the step timeout, or a hung API call" ;;
             *)
               reason="the agent stopped with \`$subtype\`" ;;
           esac
@@ -283,7 +284,12 @@ jobs:
             # non-success subtype), while the stub's spinner survives the agent's
             # own rewrites. So do not classify — keep it, collapsed, so the
             # visible state is the notice and nothing is destroyed.
-            if [ -n "$prior" ] && ! printf '%s' "$prior" | grep -qF 'GLM review did not complete'; then
+            # Anchored to the first line, not `grep -qF` anywhere in the body:
+            # the header is public text a verdict can legitimately quote (this
+            # repo's README ships it verbatim), and matching mid-body would drop
+            # exactly the verdict the fold exists to keep. A notice from an
+            # earlier attempt on this run always *starts* with the line.
+            if [ -n "$prior" ] && [ "$(printf '%s' "$prior" | head -n 1)" != '### ⚠️ GLM review did not complete' ]; then
               printf '\n<details><summary>What this comment held when the run stopped</summary>\n\n%s\n\n</details>\n' "$prior"
             fi
           } > "$notice"
