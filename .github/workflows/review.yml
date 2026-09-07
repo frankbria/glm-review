@@ -269,7 +269,7 @@ jobs:
             success)
               reason="the agent finished but the step failed afterwards — see the log" ;;
             "")
-              reason="the step was killed before the agent wrote a result — the step timeout, or a hung API call. No transcript exists for this case: the execution file is only written once the agent's message loop returns. Re-run with \`debug_full_output: true\` to get the turns in the workflow log" ;;
+              reason="the step was killed before the agent wrote a result — the step timeout, or a hung API call. No transcript exists for this case: the execution file is only written once the agent's message loop returns. To get the turns, add \`with: { debug_full_output: true }\` to the job that calls this workflow in your repo, then re-run" ;;
             *)
               reason="the agent stopped with \`$subtype\`" ;;
           esac

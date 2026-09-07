@@ -41,10 +41,15 @@ It posts **inline comments on the exact defective lines** with severity tags, co
    ```
 
    > **Those two permissions are the whole set — but only on `@main` or a pin at
-   > `5864495` or newer.** Neither `id-token: write` nor `issues: write` is
+   > `5003ffb` or newer.** Neither `id-token: write` nor `issues: write` is
    > required: the reviewer passes an explicit `github_token` so the OIDC →
    > App-token exchange never runs, and it only ever comments on pull requests,
    > which `pull-requests: write` covers.
+   >
+   > The two were dropped one PR apart, so the floor is the *later* of them:
+   > `id-token: write` went at `fc16d4f` (merged as `5864495`) but `issues: write`
+   > survived until `5003ffb` (merged as `00c986e`). Pinning at `5864495` with this
+   > block under-grants `issues: write` and startup-fails.
    >
    > The two directions are not symmetric, so keep the pin and this block in
    > step. Granting *more* than the callee declares is harmless, so callers still
@@ -52,7 +57,7 @@ It posts **inline comments on the exact defective lines** with severity tags, co
    > *less* is fatal: GitHub refuses to start a run whose caller grants less than
    > the called job requests, and it refuses before any job exists, so every run
    > is a `startup_failure` with no log to explain it. Copying this block onto a
-   > pin older than `5864495` (whose job still declared both) means the check
+   > pin older than `5003ffb` (whose job still declared `issues: write`) means the check
    > never runs at all — that is [#9](https://github.com/frankbria/glm-review/issues/9),
    > where one repo sat at 20/20 `startup_failure`.
 
