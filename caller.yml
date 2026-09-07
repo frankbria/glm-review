@@ -8,11 +8,18 @@ on:
 
 jobs:
   review:
-    # Only review substantial changes (5+ files, or 20+ additions, or 20+ deletions)
+    # Skip bot-authored PRs: claude-code-action refuses any run whose actor is
+    # not a User and fails the step to say so, painting a PR red that was never
+    # reviewed. Its `allowed_bots` input would not help — GitHub runs
+    # Dependabot-triggered pull_request workflows with a read-only token and the
+    # separate Dependabot secret store, so ZHIPU_API_KEY would arrive empty.
+    # `user.type` covers every bot rather than naming one.
+    # Then: only review substantial changes (5+ files, or 20+ additions/deletions).
     if: |
-      github.event.pull_request.changed_files >= 5 ||
-      github.event.pull_request.additions >= 20 ||
-      github.event.pull_request.deletions >= 20
+      github.event.pull_request.user.type == 'User' &&
+      (github.event.pull_request.changed_files >= 5 ||
+       github.event.pull_request.additions >= 20 ||
+       github.event.pull_request.deletions >= 20)
     uses: frankbria/glm-review/.github/workflows/review.yml@main
     permissions:
       contents: read

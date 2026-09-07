@@ -25,11 +25,13 @@ It posts **inline comments on the exact defective lines** with severity tags, co
 
    jobs:
      review:
-       # Only review substantial changes (5+ files, or 20+ additions, or 20+ deletions)
+       # Skip bot-authored PRs, then only review substantial changes
+       # (5+ files, or 20+ additions, or 20+ deletions)
        if: |
-         github.event.pull_request.changed_files >= 5 ||
-         github.event.pull_request.additions >= 20 ||
-         github.event.pull_request.deletions >= 20
+         github.event.pull_request.user.type == 'User' &&
+         (github.event.pull_request.changed_files >= 5 ||
+          github.event.pull_request.additions >= 20 ||
+          github.event.pull_request.deletions >= 20)
        uses: frankbria/glm-review/.github/workflows/review.yml@main
        permissions:
          contents: read
@@ -38,12 +40,30 @@ It posts **inline comments on the exact defective lines** with severity tags, co
          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
    ```
 
-   > Those two permissions are the whole set. Neither `id-token: write` nor
-   > `issues: write` is required — the reviewer passes an explicit `github_token`
-   > so the OIDC → App-token exchange never runs, and it only ever comments on
-   > pull requests, which `pull-requests: write` covers. Existing callers that
-   > still grant either keep working (a caller may grant more than the called job
-   > requests), but both are dead privilege — drop them on the next edit.
+   > **Those two permissions are the whole set — but only on `@main` or a pin at
+   > `5864495` or newer.** Neither `id-token: write` nor `issues: write` is
+   > required: the reviewer passes an explicit `github_token` so the OIDC →
+   > App-token exchange never runs, and it only ever comments on pull requests,
+   > which `pull-requests: write` covers.
+   >
+   > The two directions are not symmetric, so keep the pin and this block in
+   > step. Granting *more* than the callee declares is harmless, so callers still
+   > listing either permission keep working — drop them on the next edit. Granting
+   > *less* is fatal: GitHub refuses to start a run whose caller grants less than
+   > the called job requests, and it refuses before any job exists, so every run
+   > is a `startup_failure` with no log to explain it. Copying this block onto a
+   > pin older than `5864495` (whose job still declared both) means the check
+   > never runs at all — that is [#9](https://github.com/frankbria/glm-review/issues/9),
+   > where one repo sat at 20/20 `startup_failure`.
+
+   > **The bot guard is not optional if the repo uses Dependabot.**
+   > `claude-code-action` refuses any run whose actor is not a `User` and fails
+   > the step to say so, which paints a PR red that was never reviewed. The
+   > action's `allowed_bots` input is not the fix here: GitHub runs
+   > Dependabot-triggered `pull_request` workflows with a read-only token and the
+   > separate Dependabot secret store, so `ZHIPU_API_KEY` arrives empty and the
+   > summary comment could not be posted regardless. Skipping reports these grey
+   > and honest. Testing `user.type` rather than a bot name covers all of them.
 
 ## Options
 
