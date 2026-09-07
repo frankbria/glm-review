@@ -25,10 +25,11 @@ It posts **inline comments on the exact defective lines** with severity tags, co
 
    jobs:
      review:
-       # Skip bot-authored PRs, then only review substantial changes
-       # (5+ files, or 20+ additions, or 20+ deletions)
+       # Skip bot-authored and bot-pushed PRs, then only review substantial
+       # changes (5+ files, or 20+ additions, or 20+ deletions)
        if: |
          github.event.pull_request.user.type == 'User' &&
+         github.event.sender.type == 'User' &&
          (github.event.pull_request.changed_files >= 5 ||
           github.event.pull_request.additions >= 20 ||
           github.event.pull_request.deletions >= 20)
@@ -69,6 +70,16 @@ It posts **inline comments on the exact defective lines** with severity tags, co
    > separate Dependabot secret store, so `ZHIPU_API_KEY` arrives empty and the
    > summary comment could not be posted regardless. Skipping reports these grey
    > and honest. Testing `user.type` rather than a bot name covers all of them.
+   >
+   > **Test `sender.type` too — they are different accounts.** The action keys
+   > off `github.actor`, which is the PR *author* on `opened` but the **pusher**
+   > on `synchronize`. Gating on the author alone still goes red on a
+   > human-authored PR that a bot pushed to — an autofix job, a rebase app,
+   > `github-actions[bot]` — and the size gate cannot save it, because
+   > `changed_files` and `additions` are cumulative PR totals, so a one-line bot
+   > push to an already-qualifying PR re-fires the trigger. Both terms are ANDed
+   > before the parenthesized size group, so they can only narrow what runs; a
+   > null `sender` compares false and skips, failing closed.
 
 ## Options
 
