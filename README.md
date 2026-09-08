@@ -60,7 +60,10 @@ It posts **inline comments on the exact defective lines** with severity tags, co
    > is a `startup_failure` with no log to explain it. Copying this block onto a
    > pin older than `5003ffb` (whose job still declared `issues: write`) means the check
    > never runs at all — that is [#9](https://github.com/frankbria/glm-review/issues/9),
-   > where one repo sat at 20/20 `startup_failure`.
+   > where one repo sat silent for 266 consecutive runs.
+   >
+   > **You do not have to hold this invariant by hand** — see
+   > [Guarding the pin ↔ permissions invariant](#guarding-the-pin--permissions-invariant).
 
    > **The bot guard is not optional if the repo uses Dependabot.**
    > `claude-code-action` refuses any run whose actor is not a `User` and fails
@@ -98,6 +101,65 @@ It posts **inline comments on the exact defective lines** with severity tags, co
        secrets:
          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
 ```
+
+## Guarding the pin ↔ permissions invariant
+
+The rule above — keep the pin and the `permissions:` block in step — was enforced
+only by that paragraph until it failed: one repo copied the reduced block onto an
+older pin and the check went silent for **266 consecutive runs** across two
+months, looking configured the whole time. A rule a reader has to remember is not
+enforced. This repo ships a checker for it.
+
+```yaml
+# .github/workflows/check-permissions.yml
+name: Check caller permissions
+on:
+  pull_request:
+    paths: [".github/workflows/**"]
+
+jobs:
+  check:
+    uses: frankbria/glm-review/.github/workflows/check-permissions.yml@main
+    permissions:
+      contents: read
+```
+
+It reads every reusable-workflow call in your `.github/workflows/`, fetches each
+callee at the ref you pinned, and fails the PR if a calling job grants less than
+the called job declares — naming the scope and the level. It checks *all* your
+reusable-workflow calls, not just the ones into this repo.
+
+Three things worth knowing about it:
+
+- **It cannot be a job inside `review.yml`.** In the failure it catches,
+  `review.yml` never starts, so a guard job inside it would never run either. It
+  is a separate workflow declaring only `contents: read` — the minimum a caller
+  is ever likely to withhold — so it starts when the workflow it is checking
+  cannot. Grant it exactly that; granting less reproduces the bug on the guard.
+- **It is one-sided, because the failure is.** Over-grants print as notes and
+  never fail: granting more than the callee declares is harmless, which is
+  precisely why nobody notices the rule until they under-grant.
+- **A caller with no `permissions:` block is reported, not guessed at.** Such a
+  job runs under the repository default, which is not visible in the file, so the
+  guard says so rather than passing. Pass `strict: true` to make that a failure.
+
+The subtlety it exists for: **listing a `permissions:` block sets every scope you
+did not list to `none`.** A block that reads as a tightening is also a denial of
+everything absent from it, and nothing in the caller mentions the scope that goes
+missing. That is why the original outage was invisible in the caller's own text.
+
+Run it locally against a working tree — useful when changing `review.yml` itself,
+since the pushed callee is not yet the one you are editing:
+
+```sh
+python3 scripts/check_caller_permissions.py --callee-root . --strict \
+  caller.yml .github/workflows/glm-review.yml
+```
+
+`scripts/test_check_caller_permissions.py` covers it, including a test that
+rebuilds the exact caller/callee pair behind the 266-run outage and asserts both
+missing scopes are named. A checker that only ever passes on correct input proves
+nothing.
 
 ## How it works
 

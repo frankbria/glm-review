@@ -1,0 +1,130 @@
+name: Check caller permissions
+
+# Reusable guard: verifies that every reusable-workflow call in your repository
+# grants the called workflow the permissions it declares.
+#
+# Why this is a separate workflow rather than a job inside review.yml: in the
+# failure it exists to catch, review.yml never starts. GitHub refuses the run
+# before any job exists, so a guard job inside it would never run either. This
+# workflow declares only `contents: read`, which callers essentially always
+# grant, so it starts even when the workflow it is checking cannot.
+#
+# Install alongside your GLM Review caller:
+#
+#   name: Check caller permissions
+#   on:
+#     pull_request:
+#       paths: [".github/workflows/**"]
+#   jobs:
+#     check:
+#       uses: frankbria/glm-review/.github/workflows/check-permissions.yml@main
+#       permissions:
+#         contents: read
+#
+# Grant it exactly `contents: read`. Granting less reproduces, on the guard
+# itself, the very failure it is meant to report.
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: >-
+          Shell glob of workflow files to check, relative to the repository
+          root. Every reusable-workflow call found in them is checked, not only
+          calls into this repository.
+        type: string
+        default: .github/workflows/*.yml
+      strict:
+        description: >-
+          Fail when a caller declares no `permissions:` block at all. Such a
+          caller runs under the repository default, which is not visible in the
+          file, so the guard cannot prove the call is safe either way. Off by
+          default because inheriting the default is legitimate; turn it on to
+          require every caller to state its grants.
+        type: boolean
+        default: false
+      guard_ref:
+        description: >-
+          Ref of frankbria/glm-review to take the checker script from. Pin this
+          to the same commit you pin this workflow to if you want the script and
+          the workflow to move together; the default tracks main.
+        type: string
+        default: main
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Deliberately minimal, and deliberately the same set a caller must grant.
+    # The checker reads workflow files from the checkout and fetches remote
+    # callees over the public API; neither needs more than this.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the repository being checked
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout the checker
+        uses: actions/checkout@v6
+        with:
+          repository: frankbria/glm-review
+          ref: ${{ inputs.guard_ref }}
+          path: .glm-review-guard
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install PyYAML
+        run: pip install --disable-pip-version-check --quiet pyyaml
+
+      - name: Check caller/callee permissions
+        env:
+          # Lets the checker read callee workflows from private repositories the
+          # token can see. Public callees resolve without it.
+          GITHUB_TOKEN: ${{ github.token }}
+          PATHS: ${{ inputs.paths }}
+          STRICT: ${{ inputs.strict }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # nullglob so a glob that matches nothing expands to nothing rather
+          # than to itself, which would reach the checker as a missing filename.
+          shopt -s nullglob
+          # Unquoted on purpose: PATHS is a glob and must be expanded here.
+          # shellcheck disable=SC2206
+          files=($PATHS)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No workflow files matched '$PATHS' — nothing to check."
+            exit 0
+          fi
+          printf 'Checking:\n'
+          printf '  %s\n' "${files[@]}"
+          args=()
+          if [ "$STRICT" = "true" ]; then
+            args+=(--strict)
+          fi
+          python3 .glm-review-guard/scripts/check_caller_permissions.py \
+            "${args[@]}" "${files[@]}"
+
+      - name: Explain a failure
+        if: failure()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Caller/callee permission mismatch
+
+          A job in this repository calls a reusable workflow that declares more
+          permissions than the calling job grants. GitHub refuses to start such a
+          run **before any job exists**, so it surfaces as a `startup_failure`
+          with no log and no annotation naming the missing scope.
+
+          Two things to know:
+
+          * Listing a `permissions:` block sets every scope you did **not** list
+            to `none`. A block that reads as a tightening is also a denial of
+            everything absent from it.
+          * Fix it by adding the missing scopes to the caller, or by moving the
+            pin forward to a callee version that no longer declares them. Those
+            two are not interchangeable — check which one you mean.
+          EOF
