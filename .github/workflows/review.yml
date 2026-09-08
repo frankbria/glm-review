@@ -269,8 +269,16 @@ jobs:
           # produced a notice blaming a timeout that had not happened. Crying
           # wolf about the one failure mode the notice exists to make legible is
           # worse than saying nothing.
-          if [ "$OUTCOME" = "cancelled" ]; then
-            reason="the run was cancelled before the agent finished — usually a newer push superseding it, since this workflow cancels in-progress runs for the same pull request. Nothing is wrong with the review itself: read the run for the newest commit, which replaces this comment when it finishes"
+          # Both conditions, not just the outcome. A cancellation can land after
+          # the agent already wrote its result — the message loop returns, the
+          # verdict is folded into this comment, and the kill arrives while the
+          # action is still doing its closing API calls. Keying on the outcome
+          # alone would overwrite a real verdict (or a real `error_max_turns`)
+          # with "cancelled before the agent finished", which is false and
+          # discards the finding. An empty subtype IS the "loop never returned"
+          # case, so requiring it keeps this branch to the runs it describes.
+          if [ "$OUTCOME" = "cancelled" ] && [ -z "$subtype" ]; then
+            reason="the run was cancelled before the agent finished — usually a newer push superseding it, since this workflow cancels in-progress runs for the same pull request. Nothing is wrong with the review itself: the newest commit is reviewed by its own run, which posts its verdict as a separate comment. This notice is not replaced by that run and can be disregarded once it appears"
           else
             case "$subtype" in
               error_max_turns)
