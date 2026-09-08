@@ -30,11 +30,16 @@ on:
     inputs:
       paths:
         description: >-
-          Shell glob of workflow files to check, relative to the repository
-          root. Every reusable-workflow call found in them is checked, not only
-          calls into this repository.
+          Space-separated shell globs of workflow files to check, relative to
+          the repository root. Every reusable-workflow call found in them is
+          checked, not only calls into this repository.
+          The default covers BOTH extensions. GitHub runs `.yml` and `.yaml`
+          alike, so globbing only one leaves a silent bypass: a workflow named
+          `.yaml` would execute with the repository's credentials while passing
+          a check that never looked at it. Overriding this is how you narrow the
+          set; do it deliberately.
         type: string
-        default: .github/workflows/*.yml
+        default: .github/workflows/*.yml .github/workflows/*.yaml
       strict:
         description: >-
           Fail when a caller declares no `permissions:` block at all. Such a

@@ -261,18 +261,38 @@ jobs:
               "$EXECUTION_FILE" 2>/dev/null || true)"
           fi
 
-          case "$subtype" in
-            error_max_turns)
-              reason="the agent hit its turn cap (\`--max-turns\`) before it finished reviewing" ;;
-            error_during_execution)
-              reason="the agent errored part-way through the review" ;;
-            success)
-              reason="the agent finished but the step failed afterwards — see the log" ;;
-            "")
-              reason="the step was killed before the agent wrote a result — the step timeout, or a hung API call. No transcript exists for this case: the execution file is only written once the agent's message loop returns. To get the turns, add \`with: { debug_full_output: true }\` to the job that calls this workflow in your repo, then re-run" ;;
-            *)
-              reason="the agent stopped with \`$subtype\`" ;;
-          esac
+          # Cancellation is checked before the subtype, because a cancelled step
+          # writes no execution file and would otherwise fall into the ""
+          # branch below and be reported as a timeout or a hung request. That is
+          # not a hypothetical: the common cause is this workflow's own
+          # `cancel-in-progress`, so every push made while a review is running
+          # produced a notice blaming a timeout that had not happened. Crying
+          # wolf about the one failure mode the notice exists to make legible is
+          # worse than saying nothing.
+          # Both conditions, not just the outcome. A cancellation can land after
+          # the agent already wrote its result — the message loop returns, the
+          # verdict is folded into this comment, and the kill arrives while the
+          # action is still doing its closing API calls. Keying on the outcome
+          # alone would overwrite a real verdict (or a real `error_max_turns`)
+          # with "cancelled before the agent finished", which is false and
+          # discards the finding. An empty subtype IS the "loop never returned"
+          # case, so requiring it keeps this branch to the runs it describes.
+          if [ "$OUTCOME" = "cancelled" ] && [ -z "$subtype" ]; then
+            reason="the run was cancelled before the agent finished — usually a newer push superseding it, since this workflow cancels in-progress runs for the same pull request. Nothing is wrong with the review itself: the newest commit is reviewed by its own run, which posts its verdict as a separate comment. This notice is not replaced by that run and can be disregarded once it appears"
+          else
+            case "$subtype" in
+              error_max_turns)
+                reason="the agent hit its turn cap (\`--max-turns\`) before it finished reviewing" ;;
+              error_during_execution)
+                reason="the agent errored part-way through the review" ;;
+              success)
+                reason="the agent finished but the step failed afterwards — see the log" ;;
+              "")
+                reason="the step was killed before the agent wrote a result — the step timeout, or a hung API call. No transcript exists for this case: the execution file is only written once the agent's message loop returns. To get the turns, add \`with: { debug_full_output: true }\` to the job that calls this workflow in your repo, then re-run" ;;
+              *)
+                reason="the agent stopped with \`$subtype\`" ;;
+            esac
+          fi
           echo "Review did not complete (outcome=$OUTCOME, result=${subtype:-none}): $reason"
 
           # The tracking comment carries a link to this run, which is what makes
