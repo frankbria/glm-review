@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Distinct from review.yml's `glm-review-*` group on purpose. A caller and a
+  # callee sharing a concurrency group with cancel-in-progress means the callee
+  # cancels its own parent the moment it queues — that cost
+  # narrative-modeling-app a run that ended in 2 seconds having started no jobs
+  # at all (glm-review#9). Never reuse a group name across a call boundary.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Workflow-call guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install PyYAML
+        run: pip install --disable-pip-version-check --quiet pyyaml
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' --verbose
+
+      - name: Check this repo's own callers
+        # --callee-root . so caller.yml, which pins @main, is checked against the
+        # review.yml in *this* commit rather than the one already on main. That
+        # is the check that matters: it catches a PR that adds a permission to
+        # the callee without updating the template consumers copy, which is the
+        # shape of the bug that broke narrative-modeling-app for 266 runs.
+        run: |
+          python3 scripts/check_workflow_calls.py \
+            --callee-root . --no-network --strict \
+            caller.yml .github/workflows/glm-review.yml

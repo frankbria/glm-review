@@ -60,7 +60,10 @@ It posts **inline comments on the exact defective lines** with severity tags, co
    > is a `startup_failure` with no log to explain it. Copying this block onto a
    > pin older than `5003ffb` (whose job still declared `issues: write`) means the check
    > never runs at all — that is [#9](https://github.com/frankbria/glm-review/issues/9),
-   > where one repo sat at 20/20 `startup_failure`.
+   > where one repo sat silent for 266 consecutive runs.
+   >
+   > **You do not have to hold this invariant by hand** — see
+   > [Guarding the pin ↔ permissions invariant](#guarding-the-pin--permissions-invariant).
 
    > **The bot guard is not optional if the repo uses Dependabot.**
    > `claude-code-action` refuses any run whose actor is not a `User` and fails
@@ -98,6 +101,89 @@ It posts **inline comments on the exact defective lines** with severity tags, co
        secrets:
          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
 ```
+
+## Guarding the pin ↔ permissions invariant
+
+Two ways to configure this reviewer so it silently never runs. They happened in
+the same repo, were introduced by the same commit (titled `harden(ci)`), and
+together left the check dead for **266 consecutive runs** across two months while
+looking configured the whole time. Both were held only by prose until now:
+
+```yaml
+# .github/workflows/check-workflow-calls.yml
+name: Check workflow calls
+on:
+  pull_request:
+    paths: [".github/workflows/**"]
+
+jobs:
+  check:
+    uses: frankbria/glm-review/.github/workflows/check-workflow-calls.yml@main
+    permissions:
+      contents: read
+```
+
+It reads every reusable-workflow call in your `.github/workflows/` — not just the
+ones into this repo — resolves each callee at the ref you pinned, and fails the PR
+on either failure below.
+
+**1. The caller grants less than the callee declares.** GitHub refuses the run
+before any job exists, so it is a `startup_failure` with no log and no annotation
+naming the scope. The subtlety: **listing a `permissions:` block sets every scope
+you did not list to `none`.** A block that reads as a tightening is also a denial
+of everything absent from it, and nothing in the caller mentions the scope that
+goes missing — which is why the outage was invisible in the caller's own text.
+
+**2. The caller's `concurrency:` group can collide with the callee's.** A called
+reusable workflow joins its own group while the caller still holds it, so on a
+collision the callee contends with its own parent: with `cancel-in-progress` it
+cancels the parent on queue (one run ended in **2 seconds** having started no jobs
+at all), and without it the two deadlock until the job timeout. Comparing the
+group strings is not enough — the real pair was
+
+```
+caller:  glm-review-${{ github.event.pull_request.number }}
+callee:  glm-review-${{ github.event.pull_request.number || github.ref }}
+```
+
+different text, identical expansion on a `pull_request` event, because `||`
+yields its first truthy operand. The checker compares the *sets of strings each
+group can expand to* and fails when they intersect.
+
+Three things worth knowing:
+
+- **It cannot be a job inside `review.yml`.** In both failures that workflow never
+  starts, so a guard job inside it would never run either. It is a separate
+  workflow declaring only `contents: read` — the minimum a caller is ever likely
+  to withhold — so it starts when the workflow it checks cannot. Grant it exactly
+  that; granting less reproduces the bug on the guard.
+- **The permissions check is one-sided, because the failure is.** Over-grants
+  print as notes and never fail: granting more than the callee declares is
+  harmless, which is precisely why nobody discovers the rule until they
+  under-grant.
+- **A caller with no `permissions:` block is reported, not guessed at.** Such a
+  job runs under the repository default, which is not visible in the file, so the
+  guard says it cannot decide rather than passing. Pass `strict: true` to make
+  that a failure.
+- **A call it could not check never counts as a call that passed.** An
+  unreadable callee — a renamed or moved workflow a caller still points at — is a
+  hard failure, and anything merely undecided (an unfetched callee, two
+  concurrency groups whose expressions it cannot evaluate) keeps the run from
+  printing a clean bill of health. Reporting an unchecked call as OK would
+  reproduce, one level up, exactly the silence this tool exists to end.
+
+Run it locally against a working tree — useful when changing `review.yml` itself,
+since the pushed callee is not yet the one you are editing:
+
+```sh
+python3 scripts/check_workflow_calls.py --callee-root . --strict \
+  caller.yml .github/workflows/glm-review.yml
+```
+
+`scripts/test_check_workflow_calls.py` covers it. The two load-bearing tests
+rebuild the actual caller/callee pair behind the outage and assert the checker
+names both causes — the missing `id-token: write` and the group collision. A
+checker that only ever passes on correct input proves nothing.
 
 ## How it works
 
