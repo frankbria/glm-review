@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for check_caller_permissions.
+"""Tests for check_workflow_calls.
 
 The load-bearing test is `test_reproduces_the_266_run_outage`: it rebuilds the
 exact caller/callee pair that made `frankbria/narrative-modeling-app` fail to
@@ -20,7 +20,7 @@ from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import check_caller_permissions as guard
+import check_workflow_calls as guard
 
 
 # The callee as it stood at b877d15a -- the pin narrative-modeling-app was
@@ -411,6 +411,196 @@ class TestExitCodes(GuardTestCase):
     def test_missing_file_exits_two(self) -> None:
         code, _ = self.run_main([str(self.root / "nope.yml")])
         self.assertEqual(code, 2)
+
+
+# The two groups that actually collided, copied verbatim from
+# narrative-modeling-app's glm-review.yml at f6c14ee^ and glm-review's
+# review.yml at b877d15a. They are NOT the same string -- that is the point.
+REAL_CALLER_GROUP = "glm-review-${{ github.event.pull_request.number }}"
+REAL_CALLEE_GROUP = "glm-review-${{ github.event.pull_request.number || github.ref }}"
+
+
+def callee_with_concurrency(group: str, cancel: bool = True) -> str:
+    return f"""
+name: X
+on: workflow_call
+concurrency:
+  group: {group}
+  cancel-in-progress: {str(cancel).lower()}
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - run: echo hi
+"""
+
+
+def caller_with_concurrency(group: str | None, cancel: bool = True) -> str:
+    block = ""
+    if group is not None:
+        block = (
+            f"concurrency:\n  group: {group}\n"
+            f"  cancel-in-progress: {str(cancel).lower()}\n"
+        )
+    return f"""
+name: GLM Review
+on: pull_request
+{block}jobs:
+  review:
+    uses: o/r/.github/workflows/review.yml@sha
+    permissions:
+      contents: read
+"""
+
+
+class TestExpansionModel(unittest.TestCase):
+    """`||` yields its first truthy operand, so text equality is the wrong test."""
+
+    def test_alternatives_become_separate_candidates(self) -> None:
+        self.assertEqual(
+            guard.expand_candidates("g-${{ a || b }}"),
+            {"g-a", "g-b"},
+        )
+
+    def test_whitespace_inside_an_expression_is_normalized(self) -> None:
+        self.assertEqual(
+            guard.expand_candidates("g-${{   a   }}"),
+            guard.expand_candidates("g-${{a}}"),
+        )
+
+    def test_literal_group_has_one_candidate(self) -> None:
+        self.assertEqual(guard.expand_candidates("static"), {"static"})
+
+    def test_multiple_slots_multiply(self) -> None:
+        self.assertEqual(
+            guard.expand_candidates("${{ a || b }}-${{ c || d }}"),
+            {"a-c", "a-d", "b-c", "b-d"},
+        )
+
+    def test_runaway_expansion_bails_out(self) -> None:
+        huge = "-".join("${{ " + " || ".join("abcdef") + " }}" for _ in range(8))
+        self.assertIsNone(guard.expand_candidates(huge))
+
+    def test_real_groups_share_an_expansion_despite_differing_text(self) -> None:
+        self.assertNotEqual(REAL_CALLER_GROUP, REAL_CALLEE_GROUP)
+        collides, shared = guard.concurrency_collision(
+            REAL_CALLER_GROUP, REAL_CALLEE_GROUP
+        )
+        self.assertTrue(collides)
+        self.assertEqual(
+            shared, {"glm-review-github.event.pull_request.number"}
+        )
+
+
+class TestConcurrencyCollision(GuardTestCase):
+    def test_reproduces_the_two_second_self_cancel(self) -> None:
+        """The real pair. A text comparison would pass this and miss the bug."""
+        self.write_callee(callee_with_concurrency(REAL_CALLEE_GROUP))
+        path = self.write_caller(caller_with_concurrency(REAL_CALLER_GROUP))
+        findings = self.check(path)
+        collisions = [f for f in findings if f.kind == "concurrency-collision"]
+        self.assertEqual(len(collisions), 1, findings)
+        self.assertIn("cancels its own parent", collisions[0].detail)
+        self.assertTrue(collisions[0].fatal)
+
+    def test_identical_groups_collide(self) -> None:
+        self.write_callee(callee_with_concurrency(REAL_CALLEE_GROUP))
+        path = self.write_caller(caller_with_concurrency(REAL_CALLEE_GROUP))
+        self.assertEqual(
+            len([f for f in self.check(path) if f.kind == "concurrency-collision"]), 1
+        )
+
+    def test_distinct_prefix_does_not_collide(self) -> None:
+        self.write_callee(callee_with_concurrency(REAL_CALLEE_GROUP))
+        path = self.write_caller(
+            caller_with_concurrency("ci-${{ github.event.pull_request.number }}")
+        )
+        self.assertEqual([f for f in self.check(path) if f.fatal], [])
+
+    def test_caller_without_concurrency_is_clean(self) -> None:
+        """The fix narrative-modeling-app shipped: drop the caller's block."""
+        self.write_callee(callee_with_concurrency(REAL_CALLEE_GROUP))
+        path = self.write_caller(caller_with_concurrency(None))
+        self.assertEqual([f for f in self.check(path) if f.fatal], [])
+
+    def test_callee_without_concurrency_is_clean(self) -> None:
+        # Permissions deliberately matched to the caller fixture's
+        # `contents: read`, so this isolates the concurrency check.
+        self.write_callee(
+            """
+name: X
+on: workflow_call
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - run: echo hi
+"""
+        )
+        path = self.write_caller(caller_with_concurrency(REAL_CALLEE_GROUP))
+        self.assertEqual([f for f in self.check(path) if f.fatal], [])
+
+    def test_collision_without_cancel_is_reported_as_a_deadlock(self) -> None:
+        self.write_callee(callee_with_concurrency(REAL_CALLEE_GROUP, cancel=False))
+        path = self.write_caller(
+            caller_with_concurrency(REAL_CALLEE_GROUP, cancel=False)
+        )
+        collisions = [f for f in self.check(path) if f.kind == "concurrency-collision"]
+        self.assertEqual(len(collisions), 1)
+        self.assertIn("job timeout", collisions[0].detail)
+
+    def test_job_level_caller_concurrency_is_checked(self) -> None:
+        self.write_callee(callee_with_concurrency(REAL_CALLEE_GROUP))
+        path = self.write_caller(
+            f"""
+name: GLM Review
+on: pull_request
+jobs:
+  review:
+    uses: o/r/.github/workflows/review.yml@sha
+    permissions:
+      contents: read
+    concurrency:
+      group: {REAL_CALLER_GROUP}
+      cancel-in-progress: true
+"""
+        )
+        collisions = [f for f in self.check(path) if f.kind == "concurrency-collision"]
+        self.assertEqual(len(collisions), 1)
+        self.assertIn("job `review`", collisions[0].detail)
+
+    def test_shorthand_string_concurrency_is_parsed(self) -> None:
+        self.write_callee(
+            """
+name: X
+on: workflow_call
+concurrency: shared-group
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"""
+        )
+        path = self.write_caller(
+            """
+name: GLM Review
+on: pull_request
+concurrency: shared-group
+jobs:
+  review:
+    uses: o/r/.github/workflows/review.yml@sha
+    permissions:
+      contents: read
+"""
+        )
+        self.assertEqual(
+            len([f for f in self.check(path) if f.kind == "concurrency-collision"]), 1
+        )
 
 
 class TestThisRepository(unittest.TestCase):

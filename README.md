@@ -104,62 +104,80 @@ It posts **inline comments on the exact defective lines** with severity tags, co
 
 ## Guarding the pin ↔ permissions invariant
 
-The rule above — keep the pin and the `permissions:` block in step — was enforced
-only by that paragraph until it failed: one repo copied the reduced block onto an
-older pin and the check went silent for **266 consecutive runs** across two
-months, looking configured the whole time. A rule a reader has to remember is not
-enforced. This repo ships a checker for it.
+Two ways to configure this reviewer so it silently never runs. They happened in
+the same repo, were introduced by the same commit (titled `harden(ci)`), and
+together left the check dead for **266 consecutive runs** across two months while
+looking configured the whole time. Both were held only by prose until now:
 
 ```yaml
-# .github/workflows/check-permissions.yml
-name: Check caller permissions
+# .github/workflows/check-workflow-calls.yml
+name: Check workflow calls
 on:
   pull_request:
     paths: [".github/workflows/**"]
 
 jobs:
   check:
-    uses: frankbria/glm-review/.github/workflows/check-permissions.yml@main
+    uses: frankbria/glm-review/.github/workflows/check-workflow-calls.yml@main
     permissions:
       contents: read
 ```
 
-It reads every reusable-workflow call in your `.github/workflows/`, fetches each
-callee at the ref you pinned, and fails the PR if a calling job grants less than
-the called job declares — naming the scope and the level. It checks *all* your
-reusable-workflow calls, not just the ones into this repo.
+It reads every reusable-workflow call in your `.github/workflows/` — not just the
+ones into this repo — resolves each callee at the ref you pinned, and fails the PR
+on either failure below.
 
-Three things worth knowing about it:
+**1. The caller grants less than the callee declares.** GitHub refuses the run
+before any job exists, so it is a `startup_failure` with no log and no annotation
+naming the scope. The subtlety: **listing a `permissions:` block sets every scope
+you did not list to `none`.** A block that reads as a tightening is also a denial
+of everything absent from it, and nothing in the caller mentions the scope that
+goes missing — which is why the outage was invisible in the caller's own text.
 
-- **It cannot be a job inside `review.yml`.** In the failure it catches,
-  `review.yml` never starts, so a guard job inside it would never run either. It
-  is a separate workflow declaring only `contents: read` — the minimum a caller
-  is ever likely to withhold — so it starts when the workflow it is checking
-  cannot. Grant it exactly that; granting less reproduces the bug on the guard.
-- **It is one-sided, because the failure is.** Over-grants print as notes and
-  never fail: granting more than the callee declares is harmless, which is
-  precisely why nobody notices the rule until they under-grant.
+**2. The caller's `concurrency:` group can collide with the callee's.** A called
+reusable workflow joins its own group while the caller still holds it, so on a
+collision the callee contends with its own parent: with `cancel-in-progress` it
+cancels the parent on queue (one run ended in **2 seconds** having started no jobs
+at all), and without it the two deadlock until the job timeout. Comparing the
+group strings is not enough — the real pair was
+
+```
+caller:  glm-review-${{ github.event.pull_request.number }}
+callee:  glm-review-${{ github.event.pull_request.number || github.ref }}
+```
+
+different text, identical expansion on a `pull_request` event, because `||`
+yields its first truthy operand. The checker compares the *sets of strings each
+group can expand to* and fails when they intersect.
+
+Three things worth knowing:
+
+- **It cannot be a job inside `review.yml`.** In both failures that workflow never
+  starts, so a guard job inside it would never run either. It is a separate
+  workflow declaring only `contents: read` — the minimum a caller is ever likely
+  to withhold — so it starts when the workflow it checks cannot. Grant it exactly
+  that; granting less reproduces the bug on the guard.
+- **The permissions check is one-sided, because the failure is.** Over-grants
+  print as notes and never fail: granting more than the callee declares is
+  harmless, which is precisely why nobody discovers the rule until they
+  under-grant.
 - **A caller with no `permissions:` block is reported, not guessed at.** Such a
   job runs under the repository default, which is not visible in the file, so the
-  guard says so rather than passing. Pass `strict: true` to make that a failure.
-
-The subtlety it exists for: **listing a `permissions:` block sets every scope you
-did not list to `none`.** A block that reads as a tightening is also a denial of
-everything absent from it, and nothing in the caller mentions the scope that goes
-missing. That is why the original outage was invisible in the caller's own text.
+  guard says it cannot decide rather than passing. Pass `strict: true` to make
+  that a failure.
 
 Run it locally against a working tree — useful when changing `review.yml` itself,
 since the pushed callee is not yet the one you are editing:
 
 ```sh
-python3 scripts/check_caller_permissions.py --callee-root . --strict \
+python3 scripts/check_workflow_calls.py --callee-root . --strict \
   caller.yml .github/workflows/glm-review.yml
 ```
 
-`scripts/test_check_caller_permissions.py` covers it, including a test that
-rebuilds the exact caller/callee pair behind the 266-run outage and asserts both
-missing scopes are named. A checker that only ever passes on correct input proves
-nothing.
+`scripts/test_check_workflow_calls.py` covers it. The two load-bearing tests
+rebuild the actual caller/callee pair behind the outage and assert the checker
+names both causes — the missing `id-token: write` and the group collision. A
+checker that only ever passes on correct input proves nothing.
 
 ## How it works
 

@@ -1,34 +1,49 @@
 #!/usr/bin/env python3
-"""Check that a caller workflow grants a reusable workflow the permissions it declares.
+"""Check that a workflow's reusable-workflow calls can actually start.
 
-GitHub refuses to start a run whose caller job grants *less* than the called
-workflow's job declares. It refuses before any job exists, so the run is a
-`startup_failure` with no log and no annotation naming the missing scope. That
-failure mode cost `frankbria/narrative-modeling-app` 266 consecutive runs over
-two months, during which the check appeared to be configured and was in fact
-never executing (glm-review#9).
+Two ways a caller can break a call it looks correctly configured for. Both were
+found in one repository (glm-review#9), both were introduced by a single commit
+titled "harden(ci)", and between them they cost
+`frankbria/narrative-modeling-app` 266 consecutive runs over two months during
+which the check appeared configured and was never once executing.
 
-The trap is that the under-grant is invisible in the caller's own text. Listing
-a `permissions:` block at all sets every scope you *did not* list to `none`, so
-a block that reads as a tightening --
+1. UNDER-GRANTED PERMISSIONS. GitHub refuses to start a run whose caller job
+   grants *less* than the called workflow's job declares, and it refuses before
+   any job exists -- so the run is a `startup_failure` with no log and no
+   annotation naming the missing scope.
 
-    permissions:
-      contents: read
-      pull-requests: write
+   The trap is that the under-grant is invisible in the caller's own text.
+   Listing a `permissions:` block at all sets every scope you *did not* list to
+   `none`, so a block that reads as a tightening --
 
--- silently also says `issues: none`, and a callee whose job declares
-`issues: write` can no longer start. Nothing in the caller mentions `issues`.
+       permissions:
+         contents: read
+         pull-requests: write
 
-The two directions are not symmetric, which is why this check is one-sided:
-granting *more* than the callee declares is harmless (over-grants are reported
-as notes, never failures), granting less is fatal.
+   -- silently also says `issues: none`, and a callee whose job declares
+   `issues: write` can no longer start. Nothing in the caller mentions `issues`.
 
-This cannot live inside the reusable workflow it protects: in the failing case
-that workflow never starts, so a guard job inside it would never run either. It
-has to be a separate workflow whose own permissions are trivially satisfiable.
+   The two directions are not symmetric, which is why this check is one-sided:
+   granting *more* than the callee declares is harmless (over-grants are notes,
+   never failures), granting less is fatal.
+
+2. COLLIDING CONCURRENCY GROUPS. A called reusable workflow joins its own
+   `concurrency:` group while the caller is still holding it. If the groups can
+   expand to the same string, the callee contends with its own parent: with
+   `cancel-in-progress` it cancels the parent on queue (a real run ended in 2
+   seconds having started no jobs at all), and without it the two deadlock until
+   the job timeout.
+
+   Comparing the group text is not enough, and assuming otherwise would miss the
+   real case -- see `expand_candidates`.
+
+Neither check can live inside the reusable workflow it protects: in both failing
+cases that workflow never starts, so a guard job inside it would never run
+either. This has to be driven from a separate workflow whose own permissions are
+trivially satisfiable.
 
 Usage:
-    check_caller_permissions.py [options] CALLER_YAML [CALLER_YAML ...]
+    check_workflow_calls.py [options] CALLER_YAML [CALLER_YAML ...]
 
 Options:
     --callee-root DIR   Resolve `owner/repo/...@ref` callees from this local
@@ -41,8 +56,8 @@ Options:
                         failures rather than warnings.
     --quiet             Only print problems.
 
-Exit status is 1 if any under-grant was found, or if --strict and any caller
-could not be determined; 0 otherwise.
+Exit status is 1 if any under-grant or concurrency collision was found, or if
+--strict and any caller could not be determined; 0 otherwise.
 """
 
 from __future__ import annotations
@@ -60,7 +75,7 @@ from pathlib import Path
 try:
     import yaml
 except ImportError:  # pragma: no cover - dependency is declared by callers
-    sys.exit("check_caller_permissions: PyYAML is required (pip install pyyaml)")
+    sys.exit("check_workflow_calls: PyYAML is required (pip install pyyaml)")
 
 # Every scope GitHub accepts in a `permissions:` block. The list matters: an
 # explicit block sets each scope NOT named here-and-listed to `none`, so a scope
@@ -103,7 +118,7 @@ class WorkflowError(Exception):
 
 @dataclass
 class Finding:
-    kind: str  # "under-grant" | "undetermined" | "skipped" | "over-grant"
+    kind: str  # under-grant | concurrency-collision | undetermined | skipped | over-grant
     caller: str
     job: str
     callee: str
@@ -112,7 +127,7 @@ class Finding:
 
     @property
     def fatal(self) -> bool:
-        return self.kind == "under-grant"
+        return self.kind in {"under-grant", "concurrency-collision"}
 
 
 def load_workflow(text: str, origin: str) -> dict:
@@ -158,6 +173,89 @@ def normalize_permissions(node: object, origin: str) -> dict[str, int] | None:
             grants[scope] = LEVELS[level_name]
         return grants
     raise WorkflowError(f"{origin}: permissions must be a mapping or a string")
+
+
+def parse_concurrency(node: object, origin: str) -> tuple[str, bool] | None:
+    """Return (group, cancel_in_progress) for a `concurrency:` block, or None."""
+    if node is None:
+        return None
+    if isinstance(node, str):
+        return node, False
+    if isinstance(node, dict):
+        group = node.get("group")
+        if group is None:
+            raise WorkflowError(f"{origin}: `concurrency:` has no `group`")
+        cancel = node.get("cancel-in-progress", False)
+        # An expression here (`${{ ... }}`) cannot be evaluated statically; treat
+        # it as cancelling, which is the dangerous reading.
+        if isinstance(cancel, str):
+            cancel = cancel.strip().lower() not in {"false", ""}
+        return str(group), bool(cancel)
+    raise WorkflowError(f"{origin}: `concurrency:` must be a string or a mapping")
+
+
+# Cap on how many expansions one group expression may produce before the checker
+# stops enumerating. Reached only by a group with many `||` alternatives.
+MAX_CANDIDATES = 64
+
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+
+
+def expand_candidates(group: str) -> set[str] | None:
+    """Every string a concurrency group could expand to, or None if too many.
+
+    Textual comparison is not enough, and assuming otherwise would have missed
+    the collision this check exists for. The real pair was
+
+        caller:  glm-review-${{ github.event.pull_request.number }}
+        callee:  glm-review-${{ github.event.pull_request.number || github.ref }}
+
+    -- different text, identical expansion on a `pull_request` event, because
+    `||` yields its first truthy operand and a PR always has a number.
+
+    So each `${{ ... }}` slot is modelled as the set of its `||` alternatives,
+    and the candidates are the product across slots. Two groups collide if their
+    candidate sets intersect. This over-approximates (it ignores which operand is
+    actually truthy), which is the right direction: a false "these could collide"
+    costs a comment, a missed collision costs a silent outage.
+    """
+    parts: list[list[str]] = []
+    literal_start = 0
+    for match in EXPRESSION.finditer(group):
+        parts.append([group[literal_start : match.start()]])
+        alternatives = [
+            " ".join(alt.split()) for alt in match.group(1).split("||")
+        ]
+        parts.append(sorted({alt for alt in alternatives if alt}) or [""])
+        literal_start = match.end()
+    parts.append([group[literal_start:]])
+
+    total = 1
+    for options in parts:
+        total *= len(options)
+        if total > MAX_CANDIDATES:
+            return None
+
+    candidates = {""}
+    for options in parts:
+        candidates = {prefix + option for prefix in candidates for option in options}
+    return candidates
+
+
+def concurrency_collision(
+    caller_group: str, callee_group: str
+) -> tuple[bool, set[str]]:
+    """(collides, shared expansions). Unknown expansions fall back to text equality."""
+    caller_candidates = expand_candidates(caller_group)
+    callee_candidates = expand_candidates(callee_group)
+    if caller_candidates is None or callee_candidates is None:
+        normalized_caller = " ".join(caller_group.split())
+        normalized_callee = " ".join(callee_group.split())
+        if normalized_caller == normalized_callee:
+            return True, {normalized_caller}
+        return False, set()
+    shared = caller_candidates & callee_candidates
+    return bool(shared), shared
 
 
 def jobs_of(doc: dict, origin: str) -> dict[str, dict]:
@@ -260,6 +358,80 @@ def repo_root_for(caller_path: Path) -> Path:
     return parent
 
 
+def check_concurrency(
+    caller_doc: dict,
+    job: dict,
+    job_name: str,
+    callee_doc: dict,
+    origin: str,
+    callee_label: str,
+) -> list[Finding]:
+    """Flag a caller concurrency group that can collide with its callee's.
+
+    A called reusable workflow joins its own `concurrency:` group while the
+    caller is still holding it. If the two groups can expand to the same string,
+    the callee contends with its own parent:
+
+    * with `cancel-in-progress: true`, it cancels the parent the moment it
+      queues -- run 34084053155 ended in 2 seconds having started no jobs at all;
+    * without it, the callee queues behind a caller that cannot finish until the
+      callee does, and the pair sits until the job timeout.
+
+    Neither failure names concurrency anywhere in the run.
+    """
+    findings: list[Finding] = []
+    callee_entries: list[tuple[str, tuple[str, bool]]] = []
+    workflow_level = parse_concurrency(callee_doc.get("concurrency"), callee_label)
+    if workflow_level:
+        callee_entries.append(("workflow", workflow_level))
+    for callee_job_name, callee_job in jobs_of(callee_doc, callee_label).items():
+        job_level = parse_concurrency(callee_job.get("concurrency"), callee_label)
+        if job_level:
+            callee_entries.append((f"job `{callee_job_name}`", job_level))
+    if not callee_entries:
+        return findings
+
+    caller_entries: list[tuple[str, tuple[str, bool]]] = []
+    caller_workflow = parse_concurrency(caller_doc.get("concurrency"), origin)
+    if caller_workflow:
+        caller_entries.append(("workflow level", caller_workflow))
+    caller_job = parse_concurrency(job.get("concurrency"), origin)
+    if caller_job:
+        caller_entries.append((f"job `{job_name}`", caller_job))
+
+    for caller_where, (caller_group, caller_cancel) in caller_entries:
+        for callee_where, (callee_group, callee_cancel) in callee_entries:
+            collides, shared = concurrency_collision(caller_group, callee_group)
+            if not collides:
+                continue
+            example = sorted(shared)[0] if shared else caller_group
+            if caller_cancel or callee_cancel:
+                consequence = (
+                    "the callee cancels its own parent the moment it queues — the "
+                    "run ends in seconds having started no jobs, and nothing in it "
+                    "mentions concurrency"
+                )
+            else:
+                consequence = (
+                    "the callee queues behind a caller that cannot finish until the "
+                    "callee does — both sit until the job timeout"
+                )
+            findings.append(
+                Finding(
+                    "concurrency-collision",
+                    origin,
+                    job_name,
+                    f"{callee_label} ({callee_where})",
+                    f"caller's {caller_where} group {caller_group!r} and the callee's "
+                    f"{callee_group!r} can both expand to {example!r}, so "
+                    f"{consequence}. Remove the caller's block (the callee's already "
+                    f"cancels superseded runs) or give it a group name that cannot "
+                    f"collide.",
+                )
+            )
+    return findings
+
+
 def check_caller(
     caller_path: Path,
     callee_root: Path | None,
@@ -300,6 +472,10 @@ def check_caller(
         except WorkflowError as exc:
             findings.append(Finding("skipped", origin, job_name, uses, str(exc)))
             continue
+
+        findings.extend(
+            check_concurrency(doc, job, job_name, callee_doc, origin, callee_label)
+        )
 
         granted, source = effective_permissions(job, doc, origin)
         if granted is None:
@@ -376,7 +552,8 @@ def check_caller(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Check a caller workflow grants its reusable callee enough permissions."
+        description="Check a workflow's reusable-workflow calls can start: "
+        "permissions cover what the callee declares, and concurrency groups cannot collide."
     )
     parser.add_argument("callers", nargs="+", type=Path, metavar="CALLER_YAML")
     parser.add_argument("--callee-root", type=Path, default=None)
@@ -428,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             marker = {
                 "under-grant": "FAIL",
+                "concurrency-collision": "FAIL",
                 "undetermined": "WARN",
                 "skipped": "SKIP",
                 "over-grant": "note",
@@ -441,15 +619,38 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         if failed:
-            print(
-                f"\n{len(failed)} caller/callee permission mismatch(es). "
-                "Add the missing scopes to the caller, or move the pin forward "
-                "to a callee that no longer declares them.",
-                file=sys.stderr,
+            counts: dict[str, int] = {}
+            for finding in failed:
+                counts[finding.kind] = counts.get(finding.kind, 0) + 1
+            labels = {
+                "under-grant": "permission under-grant(s)",
+                "concurrency-collision": "concurrency collision(s)",
+                "undetermined": "undeterminable caller(s)",
+            }
+            summary = ", ".join(
+                f"{count} {labels[kind]}" for kind, count in sorted(counts.items())
             )
+            print(f"\n{summary}.", file=sys.stderr)
+            if "under-grant" in counts:
+                print(
+                    "  Under-grant: add the missing scopes to the caller, or move "
+                    "the pin forward to a callee that no longer declares them. "
+                    "Those two are not interchangeable.",
+                    file=sys.stderr,
+                )
+            if "concurrency-collision" in counts:
+                print(
+                    "  Collision: drop the caller's `concurrency:` block, or give "
+                    "it a group name the callee's cannot expand to.",
+                    file=sys.stderr,
+                )
         elif not args.quiet:
             checked = len(args.callers)
-            print(f"\nOK: {checked} caller file(s) grant every scope their callees declare.")
+            print(
+                f"\nOK: {checked} file(s) checked — every reusable-workflow call "
+                "grants the scopes its callee declares, and no concurrency group "
+                "can collide with its callee's."
+            )
 
     return 1 if failed else 0
 

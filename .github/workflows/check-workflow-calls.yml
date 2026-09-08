@@ -1,23 +1,24 @@
-name: Check caller permissions
+name: Check workflow calls
 
 # Reusable guard: verifies that every reusable-workflow call in your repository
-# grants the called workflow the permissions it declares.
+# can actually start — the caller grants the permissions the callee declares, and
+# the two cannot end up in the same concurrency group.
 #
-# Why this is a separate workflow rather than a job inside review.yml: in the
-# failure it exists to catch, review.yml never starts. GitHub refuses the run
+# Why this is a separate workflow rather than a job inside review.yml: in both
+# failures it exists to catch, review.yml never starts. GitHub refuses the run
 # before any job exists, so a guard job inside it would never run either. This
 # workflow declares only `contents: read`, which callers essentially always
 # grant, so it starts even when the workflow it is checking cannot.
 #
 # Install alongside your GLM Review caller:
 #
-#   name: Check caller permissions
+#   name: Check workflow calls
 #   on:
 #     pull_request:
 #       paths: [".github/workflows/**"]
 #   jobs:
 #     check:
-#       uses: frankbria/glm-review/.github/workflows/check-permissions.yml@main
+#       uses: frankbria/glm-review/.github/workflows/check-workflow-calls.yml@main
 #       permissions:
 #         contents: read
 #
@@ -79,7 +80,7 @@ jobs:
       - name: Install PyYAML
         run: pip install --disable-pip-version-check --quiet pyyaml
 
-      - name: Check caller/callee permissions
+      - name: Check reusable-workflow calls
         env:
           # Lets the checker read callee workflows from private repositories the
           # token can see. Public callees resolve without it.
@@ -105,26 +106,33 @@ jobs:
           if [ "$STRICT" = "true" ]; then
             args+=(--strict)
           fi
-          python3 .glm-review-guard/scripts/check_caller_permissions.py \
+          python3 .glm-review-guard/scripts/check_workflow_calls.py \
             "${args[@]}" "${files[@]}"
 
       - name: Explain a failure
         if: failure()
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## Caller/callee permission mismatch
+          ## A reusable-workflow call in this repository cannot start
 
-          A job in this repository calls a reusable workflow that declares more
-          permissions than the calling job grants. GitHub refuses to start such a
-          run **before any job exists**, so it surfaces as a `startup_failure`
-          with no log and no annotation naming the missing scope.
+          The step output above names which of the two problems was found.
 
-          Two things to know:
+          **Permission under-grant.** A calling job grants less than the called
+          workflow declares. GitHub refuses such a run **before any job exists**,
+          so it surfaces as a `startup_failure` with no log and no annotation
+          naming the missing scope. Note that listing a `permissions:` block sets
+          every scope you did **not** list to `none` — a block that reads as a
+          tightening is also a denial of everything absent from it. Fix by adding
+          the missing scopes to the caller, or by moving the pin forward to a
+          callee that no longer declares them. Those are not interchangeable.
 
-          * Listing a `permissions:` block sets every scope you did **not** list
-            to `none`. A block that reads as a tightening is also a denial of
-            everything absent from it.
-          * Fix it by adding the missing scopes to the caller, or by moving the
-            pin forward to a callee version that no longer declares them. Those
-            two are not interchangeable — check which one you mean.
+          **Concurrency collision.** The caller's group and the callee's can
+          expand to the same string, so the callee contends with its own parent —
+          cancelling it on queue, or deadlocking until the job timeout. Fix by
+          dropping the caller's `concurrency:` block (the callee's already
+          cancels superseded runs) or renaming its group. Note the groups need
+          not be identical text to collide: an expression offering two
+          alternatives with `||` and one naming only the first expand to the same
+          string whenever that first operand is set, which is exactly how the
+          original collision hid.
           EOF
