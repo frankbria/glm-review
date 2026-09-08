@@ -165,6 +165,12 @@ Three things worth knowing:
   job runs under the repository default, which is not visible in the file, so the
   guard says it cannot decide rather than passing. Pass `strict: true` to make
   that a failure.
+- **A call it could not check never counts as a call that passed.** An
+  unreadable callee — a renamed or moved workflow a caller still points at — is a
+  hard failure, and anything merely undecided (an unfetched callee, two
+  concurrency groups whose expressions it cannot evaluate) keeps the run from
+  printing a clean bill of health. Reporting an unchecked call as OK would
+  reproduce, one level up, exactly the silence this tool exists to end.
 
 Run it locally against a working tree — useful when changing `review.yml` itself,
 since the pushed callee is not yet the one you are editing:

@@ -50,14 +50,17 @@ Options:
                         checkout instead of fetching them, ignoring the ref.
                         Use when the callee is this repository and you want the
                         working tree checked rather than what is already pushed.
-    --no-network        Never fetch. Remote callees are reported as skipped.
-    --strict            Treat undeterminable callers (no explicit permissions
-                        anywhere, so the repository default applies) as
-                        failures rather than warnings.
+    --no-network        Never fetch. Remote callees are reported as UNVERIFIED
+                        rather than checked; the summary says so.
+    --strict            Treat everything the checker could not decide -- a caller
+                        with no explicit permissions, an unfetched callee, an
+                        undecidable concurrency group -- as a failure.
     --quiet             Only print problems.
 
-Exit status is 1 if any under-grant or concurrency collision was found, or if
---strict and any caller could not be determined; 0 otherwise.
+Exit status is 1 for a proven defect (under-grant, concurrency collision) or an
+unreadable callee, or under --strict for anything undecided; 0 otherwise. A run
+that could not verify every call never prints a clean bill of health: an
+unchecked call reported as OK is how the outage above stayed invisible.
 """
 
 from __future__ import annotations
@@ -118,7 +121,10 @@ class WorkflowError(Exception):
 
 @dataclass
 class Finding:
-    kind: str  # under-grant | concurrency-collision | undetermined | skipped | over-grant
+    # under-grant | concurrency-collision | unreadable   -> always fatal
+    # skipped | undetermined | concurrency-possible       -> fatal only under --strict
+    # over-grant                                          -> never fatal
+    kind: str
     caller: str
     job: str
     callee: str
@@ -127,7 +133,7 @@ class Finding:
 
     @property
     def fatal(self) -> bool:
-        return self.kind in {"under-grant", "concurrency-collision"}
+        return self.kind in {"under-grant", "concurrency-collision", "unreadable"}
 
 
 def load_workflow(text: str, origin: str) -> dict:
@@ -224,7 +230,7 @@ def expand_candidates(group: str) -> set[str] | None:
     for match in EXPRESSION.finditer(group):
         parts.append([group[literal_start : match.start()]])
         alternatives = [
-            " ".join(alt.split()) for alt in match.group(1).split("||")
+            canonical_operand(" ".join(alt.split())) for alt in match.group(1).split("||")
         ]
         parts.append(sorted({alt for alt in alternatives if alt}) or [""])
         literal_start = match.end()
@@ -242,20 +248,61 @@ def expand_candidates(group: str) -> set[str] | None:
     return candidates
 
 
-def concurrency_collision(
-    caller_group: str, callee_group: str
-) -> tuple[bool, set[str]]:
-    """(collides, shared expansions). Unknown expansions fall back to text equality."""
+# Context expressions that name the same value, so two groups differing only by
+# one of them still collide even though their source text does not match.
+# `github.event.number` and `github.event.pull_request.number` are both the PR
+# number on a `pull_request` event. Deliberately tiny: only genuinely
+# interchangeable pairs belong here, and a wrong entry invents collisions.
+# (`github.ref` and `github.ref_name` are NOT interchangeable -- one carries the
+# `refs/heads/` prefix.)
+CONTEXT_ALIASES = {
+    "github.event.number": "github.event.pull_request.number",
+}
+
+
+def canonical_operand(operand: str) -> str:
+    return CONTEXT_ALIASES.get(operand, operand)
+
+
+def literal_skeleton(group: str) -> str:
+    """The group with every `${{ ... }}` replaced by a placeholder.
+
+    Two groups whose skeletons differ cannot collide whatever their expressions
+    evaluate to (barring an expression that itself supplies the differing
+    literal, which no real group does). Two groups sharing a skeleton might.
+    """
+    return EXPRESSION.sub("\x00", group)
+
+
+def concurrency_collision(caller_group: str, callee_group: str) -> tuple[str, set[str]]:
+    """Return ("none" | "possible" | "definite", shared expansions).
+
+    "definite" means the two groups share an enumerable expansion. "possible"
+    means the checker cannot prove they differ: same literal skeleton, but
+    operands it cannot evaluate. Reporting "possible" separately keeps a real
+    limitation visible instead of resolving it silently to "clean" -- the
+    original collision hid for two months precisely because nothing said the
+    question had not been answered.
+    """
     caller_candidates = expand_candidates(caller_group)
     callee_candidates = expand_candidates(callee_group)
-    if caller_candidates is None or callee_candidates is None:
-        normalized_caller = " ".join(caller_group.split())
-        normalized_callee = " ".join(callee_group.split())
-        if normalized_caller == normalized_callee:
-            return True, {normalized_caller}
-        return False, set()
-    shared = caller_candidates & callee_candidates
-    return bool(shared), shared
+
+    if caller_candidates is not None and callee_candidates is not None:
+        shared = caller_candidates & callee_candidates
+        if shared:
+            return "definite", shared
+
+    normalized_caller = " ".join(caller_group.split())
+    normalized_callee = " ".join(callee_group.split())
+    if normalized_caller == normalized_callee:
+        return "definite", {normalized_caller}
+
+    if literal_skeleton(normalized_caller) == literal_skeleton(normalized_callee):
+        # Same literal text around the expressions, different expressions. They
+        # collide iff those expressions agree at run time, which cannot be
+        # decided here.
+        return "possible", set()
+    return "none", set()
 
 
 def jobs_of(doc: dict, origin: str) -> dict[str, dict]:
@@ -401,8 +448,24 @@ def check_concurrency(
 
     for caller_where, (caller_group, caller_cancel) in caller_entries:
         for callee_where, (callee_group, callee_cancel) in callee_entries:
-            collides, shared = concurrency_collision(caller_group, callee_group)
-            if not collides:
+            verdict, shared = concurrency_collision(caller_group, callee_group)
+            if verdict == "none":
+                continue
+            if verdict == "possible":
+                findings.append(
+                    Finding(
+                        "concurrency-possible",
+                        origin,
+                        job_name,
+                        f"{callee_label} ({callee_where})",
+                        f"caller's {caller_where} group {caller_group!r} and the "
+                        f"callee's {callee_group!r} have the same literal text around "
+                        f"their expressions, so they collide if those expressions ever "
+                        f"agree — which this checker cannot decide. Verify by hand, or "
+                        f"change one group's literal prefix so the question cannot "
+                        f"arise.",
+                    )
+                )
                 continue
             example = sorted(shared)[0] if shared else caller_group
             if caller_cancel or callee_cancel:
@@ -449,18 +512,35 @@ def check_caller(
         try:
             resolved = resolve_callee(uses, caller_path, callee_root, allow_network)
         except WorkflowError as exc:
+            # Fatal, not skipped. A callee that should be readable and is not
+            # leaves this call unverified, and a checker that exits 0 there
+            # prints an all-clear over work it never did -- the precise failure
+            # this tool exists to prevent, reproduced in the tool itself. A
+            # renamed callee that a caller still points at is the realistic
+            # case, and it is exactly the drift worth failing on.
             findings.append(
-                Finding("skipped", origin, job_name, uses, f"could not read callee: {exc}")
+                Finding(
+                    "unreadable",
+                    origin,
+                    job_name,
+                    uses,
+                    f"could not read callee: {exc}",
+                )
             )
             continue
         if resolved is None:
+            # Deliberate: --no-network was passed and this callee is remote.
+            # Not fatal by itself, but never silently folded into an "OK" --
+            # the summary counts it, and --strict promotes it.
             findings.append(
                 Finding(
                     "skipped",
                     origin,
                     job_name,
                     uses,
-                    "remote callee not fetched (--no-network)",
+                    "remote callee not fetched (--no-network), so this call is "
+                    "UNVERIFIED. Pass --callee-root to resolve it locally, or "
+                    "allow network access.",
                 )
             )
             continue
@@ -470,7 +550,9 @@ def check_caller(
             callee_doc = load_workflow(callee_text, callee_label)
             callee_jobs = jobs_of(callee_doc, callee_label)
         except WorkflowError as exc:
-            findings.append(Finding("skipped", origin, job_name, uses, str(exc)))
+            # Also fatal. An unparseable *caller* already hard-errors; treating
+            # an unparseable callee as a skip inverted that asymmetry.
+            findings.append(Finding("unreadable", origin, job_name, uses, str(exc)))
             continue
 
         findings.extend(
@@ -595,9 +677,15 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     failed = [f for f in findings if f.fatal]
-    undetermined = [f for f in findings if f.kind == "undetermined"]
+    # Everything the checker could not decide. None of these is a proven defect,
+    # but each is a call it did not verify, so --strict refuses to call them OK.
+    unresolved = [
+        f
+        for f in findings
+        if f.kind in {"undetermined", "skipped", "concurrency-possible"}
+    ]
     if args.strict:
-        failed = failed + undetermined
+        failed = failed + unresolved
 
     if not args.json:
         for finding in findings:
@@ -606,7 +694,9 @@ def main(argv: list[str] | None = None) -> int:
             marker = {
                 "under-grant": "FAIL",
                 "concurrency-collision": "FAIL",
+                "unreadable": "FAIL",
                 "undetermined": "WARN",
+                "concurrency-possible": "WARN",
                 "skipped": "SKIP",
                 "over-grant": "note",
             }[finding.kind]
@@ -625,7 +715,10 @@ def main(argv: list[str] | None = None) -> int:
             labels = {
                 "under-grant": "permission under-grant(s)",
                 "concurrency-collision": "concurrency collision(s)",
+                "unreadable": "unreadable callee(s)",
                 "undetermined": "undeterminable caller(s)",
+                "concurrency-possible": "undecidable concurrency group(s)",
+                "skipped": "unverified call(s)",
             }
             summary = ", ".join(
                 f"{count} {labels[kind]}" for kind, count in sorted(counts.items())
@@ -644,13 +737,33 @@ def main(argv: list[str] | None = None) -> int:
                     "it a group name the callee's cannot expand to.",
                     file=sys.stderr,
                 )
+            if "unreadable" in counts:
+                print(
+                    "  Unreadable callee: the call could not be checked at all. "
+                    "Fix the reference (a renamed or moved callee is the usual "
+                    "cause) rather than ignoring it — an unchecked call is how the "
+                    "outage this tool exists for stayed invisible.",
+                    file=sys.stderr,
+                )
         elif not args.quiet:
             checked = len(args.callers)
-            print(
-                f"\nOK: {checked} file(s) checked — every reusable-workflow call "
-                "grants the scopes its callee declares, and no concurrency group "
-                "can collide with its callee's."
-            )
+            if unresolved:
+                kinds: dict[str, int] = {}
+                for finding in unresolved:
+                    kinds[finding.kind] = kinds.get(finding.kind, 0) + 1
+                detail = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+                print(
+                    f"\nNo defect found in {checked} file(s) — but {len(unresolved)} "
+                    f"call(s) were NOT verified ({detail}). See the WARN/SKIP lines "
+                    "above; this is not a clean bill of health. Re-run with --strict "
+                    "to treat them as failures."
+                )
+            else:
+                print(
+                    f"\nOK: {checked} file(s) checked — every reusable-workflow call "
+                    "grants the scopes its callee declares, and no concurrency group "
+                    "can collide with its callee's."
+                )
 
     return 1 if failed else 0
 

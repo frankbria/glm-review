@@ -603,6 +603,121 @@ jobs:
         )
 
 
+class TestUnverifiedCallsAreNeverGreen(GuardTestCase):
+    """Regression tests for the review findings on PR #11.
+
+    A checker that prints an all-clear over a call it never made is the exact
+    failure it exists to prevent, reproduced one level up.
+    """
+
+    def run_main(self, argv: list[str]) -> tuple[int, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = guard.main(argv)
+        return code, out.getvalue() + err.getvalue()
+
+    def test_missing_local_callee_is_fatal(self) -> None:
+        """A renamed callee that a caller still points at must not pass."""
+        path = self.write_caller(
+            caller("./.github/workflows/gone.yml", "permissions:\n  contents: read"),
+            name="glm-review.yml",
+        )
+        findings = self.check(path)
+        self.assertEqual(self.kinds(findings), ["unreadable"])
+        self.assertTrue(findings[0].fatal)
+
+    def test_unparseable_callee_is_fatal(self) -> None:
+        """An unparseable *caller* already hard-errors; the callee must match."""
+        (self.root / ".github" / "workflows" / "review.yml").write_text(
+            "jobs:\n  review:\n    permissions: [this is not a mapping\n"
+        )
+        path = self.write_caller(
+            caller("o/r/.github/workflows/review.yml@sha", "permissions: {}")
+        )
+        findings = self.check(path)
+        self.assertEqual(self.kinds(findings), ["unreadable"])
+        self.assertTrue(findings[0].fatal)
+
+    def test_skipped_call_never_prints_a_clean_bill_of_health(self) -> None:
+        path = self.write_caller(
+            caller("other/repo/.github/workflows/x.yml@sha", "permissions: {}")
+        )
+        code, text = self.run_main([str(path), "--no-network"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("OK:", text)
+        self.assertIn("NOT verified", text)
+
+    def test_strict_fails_on_an_unverified_call(self) -> None:
+        path = self.write_caller(
+            caller("other/repo/.github/workflows/x.yml@sha", "permissions: {}")
+        )
+        self.assertEqual(
+            self.run_main([str(path), "--no-network", "--strict"])[0], 1
+        )
+
+    def test_fully_verified_run_still_says_OK(self) -> None:
+        self.write_callee(CURRENT_CALLEE)
+        path = self.write_caller(
+            caller(
+                "o/r/.github/workflows/review.yml@sha",
+                "permissions:\n  contents: read\n  pull-requests: write",
+            )
+        )
+        code, text = self.run_main(
+            [str(path), "--callee-root", str(self.root), "--no-network"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("OK:", text)
+
+
+class TestOperandSpelling(GuardTestCase):
+    """Two groups can name the same value with different text and still collide."""
+
+    def test_context_alias_still_collides(self) -> None:
+        # `github.event.number` and `github.event.pull_request.number` are the
+        # same value on a pull_request event. Comparing source text calls these
+        # disjoint, which was the second finding on PR #11.
+        verdict, shared = guard.concurrency_collision(
+            "glm-review-${{ github.event.number }}", REAL_CALLEE_GROUP
+        )
+        self.assertEqual(verdict, "definite")
+        self.assertEqual(shared, {"glm-review-github.event.pull_request.number"})
+
+    def test_alias_collision_is_reported_as_fatal(self) -> None:
+        self.write_callee(callee_with_concurrency(REAL_CALLEE_GROUP))
+        path = self.write_caller(
+            caller_with_concurrency("glm-review-${{ github.event.number }}")
+        )
+        collisions = [f for f in self.check(path) if f.kind == "concurrency-collision"]
+        self.assertEqual(len(collisions), 1)
+
+    def test_same_skeleton_different_expression_is_undecidable(self) -> None:
+        """Not provably safe, so not reported as clean."""
+        verdict, _ = guard.concurrency_collision(
+            "x-${{ github.ref }}", "x-${{ github.sha }}"
+        )
+        self.assertEqual(verdict, "possible")
+
+    def test_undecidable_is_a_warning_not_a_failure(self) -> None:
+        self.write_callee(callee_with_concurrency("x-${{ github.sha }}"))
+        path = self.write_caller(caller_with_concurrency("x-${{ github.ref }}"))
+        findings = self.check(path)
+        possible = [f for f in findings if f.kind == "concurrency-possible"]
+        self.assertEqual(len(possible), 1)
+        self.assertFalse(possible[0].fatal)
+
+    def test_distinct_literal_prefix_is_provably_clean(self) -> None:
+        verdict, _ = guard.concurrency_collision(
+            "ci-${{ github.ref }}", "glm-review-${{ github.ref }}"
+        )
+        self.assertEqual(verdict, "none")
+
+    def test_alias_table_holds_only_interchangeable_pairs(self) -> None:
+        """A wrong entry here invents collisions, so keep it honest."""
+        self.assertNotIn("github.ref", guard.CONTEXT_ALIASES)
+        self.assertNotIn("github.ref_name", guard.CONTEXT_ALIASES)
+
+
 class TestThisRepository(unittest.TestCase):
     """Integration: the files this repo actually ships must pass."""
 
