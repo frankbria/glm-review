@@ -25,6 +25,20 @@ on:
           false where that is not acceptable.
         type: boolean
         default: true
+      debug_full_output:
+        description: >-
+          Log every SDK message to the workflow log as it arrives, instead of
+          just `init` and `result`. Turn this on in a repo whose reviews are
+          timing out: the transcript artifact cannot help there, because
+          claude-code-action only writes the execution file after its message
+          loop returns, so a step timeout produces no artifact at all. The
+          workflow log is written incrementally and survives the kill, which
+          makes it the only channel that can show where the time went.
+          OFF by default: the action's own input warns this output may contain
+          secrets, and on a public repo the workflow log is public. Turn it on
+          deliberately, read the failing run, turn it back off.
+        type: boolean
+        default: false
     secrets:
       ZHIPU_API_KEY:
         required: true
@@ -92,11 +106,31 @@ jobs:
         env:
           ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ZHIPU_API_KEY }}
-          API_TIMEOUT_MS: "3000000"
+          # Must stay BELOW the step timeout, or it can never fire. At the
+          # previous 3000000 (50 minutes) the SDK's own per-request timeout sat
+          # above both the step clock (35m) and the job clock (40m), so a request
+          # that never came back could only ever end as a wall-clock kill — and a
+          # kill writes no result message, so no execution file, so no transcript
+          # artifact and no reason in the notice beyond "killed".
+          #
+          # That is exactly what the four ~35m failures on hypnosis-studio look
+          # like (runs 34000601628, 34002675709, 34008880846, 34059456057): an
+          # `init` message, then nothing at all until "The action has timed out".
+          # Whether those runs were working hard or hung on one call is not
+          # recoverable from them — see debug_full_output below.
+          #
+          # 20 minutes bounds a single request while leaving 15 minutes of step
+          # budget for the SDK to surface the error, write its result, and let
+          # the transcript upload. It is well clear of real latency: successful
+          # reviews on that repo complete in 6m44s-17m33s *in total*, across
+          # every turn, so a single call approaching 20 minutes is not a slow
+          # model — it is a stuck one.
+          API_TIMEOUT_MS: "1200000"
         with:
           anthropic_api_key: ${{ secrets.ZHIPU_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           track_progress: true
+          show_full_output: ${{ inputs.debug_full_output }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
@@ -235,7 +269,7 @@ jobs:
             success)
               reason="the agent finished but the step failed afterwards — see the log" ;;
             "")
-              reason="the step was killed before the agent wrote a result — the step timeout, or a hung API call" ;;
+              reason="the step was killed before the agent wrote a result — the step timeout, or a hung API call. No transcript exists for this case: the execution file is only written once the agent's message loop returns. To get the turns, add \`with: { debug_full_output: true }\` to the job that calls this workflow in your repo, then re-run" ;;
             *)
               reason="the agent stopped with \`$subtype\`" ;;
           esac

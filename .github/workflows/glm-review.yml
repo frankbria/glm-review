@@ -13,11 +13,20 @@ on:
 
 jobs:
   review:
-    # Only review substantial changes (5+ files, or 20+ additions, or 20+ deletions)
+    # Skip bot-authored PRs — see caller.yml for why this is a skip and not the
+    # action's `allowed_bots`. This repo's own dependabot.yml opens
+    # github-actions bumps, which the size gate happens to filter out anyway;
+    # the guard is here so this file stays a faithful copy of what consumers run.
+    # `sender.type` is tested alongside it because the action keys off
+    # `github.actor`, which is the pusher on `synchronize` rather than the
+    # author — see caller.yml for the full reasoning.
+    # Then: only review substantial changes (5+ files, or 20+ additions/deletions).
     if: |
-      github.event.pull_request.changed_files >= 5 ||
-      github.event.pull_request.additions >= 20 ||
-      github.event.pull_request.deletions >= 20
+      github.event.pull_request.user.type == 'User' &&
+      github.event.sender.type == 'User' &&
+      (github.event.pull_request.changed_files >= 5 ||
+       github.event.pull_request.additions >= 20 ||
+       github.event.pull_request.deletions >= 20)
     # Local path, not `frankbria/glm-review/.github/workflows/review.yml@main`
     # as consuming repos use. A local call resolves against the caller's own
     # commit, so a PR here is reviewed by the review.yml *in that PR* rather
