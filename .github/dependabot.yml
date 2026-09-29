@@ -14,5 +14,8 @@ updates:
       semver-minor-days: 7
       semver-patch-days: 7
     groups:
+      security-updates:
+        applies-to: security-updates
+        patterns: ["*"]
       minor-and-patch:
         update-types: ["minor", "patch"]
