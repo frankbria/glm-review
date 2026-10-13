@@ -229,6 +229,38 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # The step outcome cannot tell a review from a provider rejection: when the
+      # model API refuses the request (a 429 quota error, an auth failure), the
+      # agent's result message is `subtype: success` with `is_error: true` after a
+      # single turn, so the step succeeds, the notice below never fires, and the
+      # check goes green having reviewed nothing. Seen on four
+      # frankbria/podcaststudiohub PRs on 2026-10-13 (run 38354510891: "API
+      # Error: Request rejected (429) ... Weekly/Monthly Limit Exhausted").
+      # No file is not this step's case: a killed run writes none, and the
+      # notice already covers it from the step outcome.
+      - name: Read the agent's verdict
+        id: verdict
+        if: always()
+        env:
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+        shell: bash
+        run: |
+          provider_error=false
+          message=""
+          if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+            result="$(jq -cs 'flatten | map(select(.type == "result")) | last // {}' "$EXECUTION_FILE" 2>/dev/null || echo '{}')"
+            if [ "$(printf '%s' "$result" | jq -r '.is_error // false')" = "true" ]; then
+              provider_error=true
+              message="$(printf '%s' "$result" | jq -r '.result // "no message"' | head -c 500)"
+            fi
+          fi
+          echo "provider_error=$provider_error" >> "$GITHUB_OUTPUT"
+          {
+            echo "provider_message<<GLM_REVIEW_EOF"
+            echo "$message"
+            echo "GLM_REVIEW_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       # A review that does not finish must not leave the PR claiming one is in
       # progress. `track_progress` posts a tracking comment before the agent
       # starts and rewrites it with the findings when the agent finishes; when
@@ -241,12 +273,14 @@ jobs:
       # review step above has its own shorter timeout: on a job-level timeout
       # this step would be cancelled along with everything else.
       - name: Report an incomplete review
-        if: always() && steps.review.outcome != 'success' && github.event.pull_request.number
+        if: always() && (steps.review.outcome != 'success' || steps.verdict.outputs.provider_error == 'true') && github.event.pull_request.number
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
           OUTCOME: ${{ steps.review.outcome }}
+          PROVIDER_ERROR: ${{ steps.verdict.outputs.provider_error }}
+          PROVIDER_MESSAGE: ${{ steps.verdict.outputs.provider_message }}
         shell: bash
         run: |
           set -euo pipefail
@@ -277,7 +311,9 @@ jobs:
           # with "cancelled before the agent finished", which is false and
           # discards the finding. An empty subtype IS the "loop never returned"
           # case, so requiring it keeps this branch to the runs it describes.
-          if [ "$OUTCOME" = "cancelled" ] && [ -z "$subtype" ]; then
+          if [ "${PROVIDER_ERROR:-false}" = "true" ]; then
+            reason="the model provider rejected the request, so nothing was reviewed (it reported \`${PROVIDER_MESSAGE}\`). A quota or credential problem on the provider side, not a finding about this PR: re-run the job once it is resolved"
+          elif [ "$OUTCOME" = "cancelled" ] && [ -z "$subtype" ]; then
             reason="the run was cancelled before the agent finished — usually a newer push superseding it, since this workflow cancels in-progress runs for the same pull request. Nothing is wrong with the review itself: the newest commit is reviewed by its own run, which posts its verdict as a separate comment. This notice is not replaced by that run and can be disregarded once it appears"
           else
             case "$subtype" in
@@ -355,3 +391,14 @@ jobs:
             gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F "body=@$notice" >/dev/null
             echo "No tracking comment for this run; posted the failure notice as a new comment."
           fi
+
+      # Without this the job would still pass: the review step itself succeeded.
+      # A green check that reviewed nothing is the failure this guards against.
+      - name: Fail the check on a provider error
+        if: always() && steps.verdict.outputs.provider_error == 'true'
+        env:
+          PROVIDER_MESSAGE: ${{ steps.verdict.outputs.provider_message }}
+        shell: bash
+        run: |
+          echo "::error title=GLM review did not run::The model provider rejected the request: ${PROVIDER_MESSAGE}"
+          exit 1
