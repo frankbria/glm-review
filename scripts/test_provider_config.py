@@ -72,6 +72,13 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "${{ inputs.model }}")
         self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "${{ inputs.model }}")
 
+    def test_both_comments_record_the_model(self):
+        # Filled in by Actions, not recalled by the model, so the line cannot be wrong.
+        self.assertIn("`Model: ${{ inputs.model }}`", _step(id="review")["with"]["prompt"])
+        notice = _step(name="Report an incomplete review")
+        self.assertEqual(notice["env"]["MODEL"], "${{ inputs.model }}")
+        self.assertIn("Model: \\`$MODEL\\`", notice["run"])
+
     def test_a_missing_key_is_named_in_the_notice_not_blamed_on_a_timeout(self):
         notice = _step(name="Report an incomplete review")
         self.assertEqual(notice["env"]["KEY_OUTCOME"], "${{ steps.key.outcome }}")

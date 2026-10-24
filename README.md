@@ -123,6 +123,8 @@ Moonshot:
 ```
 
 Take the endpoint and model id from the provider's Claude Code setup docs.
+Both the summary comment and the "did not complete" notice end with a
+`Model: <id>` line, so you can tell which model each review came from.
 OpenAI-only and Gemini-only APIs do not speak this protocol; they need a
 translating proxy (LiteLLM, OpenRouter) in front, with `base_url` pointed at it.
 

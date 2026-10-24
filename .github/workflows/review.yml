@@ -208,7 +208,8 @@ jobs:
             - At most 10 findings, most severe first.
             - Finish with exactly ONE summary comment via `gh pr comment`: a table
               (severity | file:line | finding), or "✅ Third Party Review: no defects found."
-              if clean.
+              if clean. End that comment with this exact line:
+              `Model: ${{ inputs.model }}`
             - Never approve or request changes on the PR.
 
             GUARDRAILS:
@@ -315,6 +316,7 @@ jobs:
           EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
           OUTCOME: ${{ steps.review.outcome }}
           KEY_OUTCOME: ${{ steps.key.outcome }}
+          MODEL: ${{ inputs.model }}
           PROVIDER_ERROR: ${{ steps.verdict.outputs.provider_error }}
           PROVIDER_MESSAGE: ${{ steps.verdict.outputs.provider_message }}
         shell: bash
@@ -395,6 +397,8 @@ jobs:
           found.").
 
           Reason: $reason.
+
+          Model: \`$MODEL\`
 
           [View job run]($run_url) — the agent transcript is attached there as a
           \`glm-review-transcript-*\` artifact when the agent got far enough to
