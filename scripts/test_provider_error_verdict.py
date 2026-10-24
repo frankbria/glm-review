@@ -40,7 +40,7 @@ REAL_VERDICT = {
     "subtype": "success",
     "is_error": False,
     "num_turns": 23,
-    "result": "✅ GLM review: no defects found.",
+    "result": "✅ Third Party Review: no defects found.",
 }
 
 

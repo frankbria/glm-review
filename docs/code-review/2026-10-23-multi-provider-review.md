@@ -12,7 +12,7 @@ The change makes the endpoint (`base_url`) and key (`MODEL_API_KEY`, with `ZHIPU
 
 **Critical Issues:** 0
 **Major Issues:** 0
-**Minor Issues:** 3
+**Minor Issues:** 3 (1 partly fixed)
 **Positive Findings:** 4
 
 ---
@@ -53,7 +53,7 @@ The change makes the endpoint (`base_url`) and key (`MODEL_API_KEY`, with `ZHIPU
 
 **Problem:** The notice header now reads "Third Party Review", but the clean-verdict line it quotes still says "GLM review".
 
-**Decision:** Follow-up. The rename was scoped to the header. The verdict string is quoted in the README and in the notice body, so rename them together if you change it.
+**Decision:** Fixed for the verdict line, which now reads `✅ Third Party Review: no defects found.` in the prompt, the notice body that quotes it, and the test fixture. The workflow name and the error title still say "GLM".
 
 ### Old-header notices are folded rather than skipped
 **Location:** `.github/workflows/review.yml` (`head -n 1` anchor)

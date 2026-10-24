@@ -207,7 +207,7 @@ jobs:
                 with matching indentation
             - At most 10 findings, most severe first.
             - Finish with exactly ONE summary comment via `gh pr comment`: a table
-              (severity | file:line | finding), or "✅ GLM review: no defects found."
+              (severity | file:line | finding), or "✅ Third Party Review: no defects found."
               if clean.
             - Never approve or request changes on the PR.
 
@@ -391,7 +391,7 @@ jobs:
 
           This run did not finish, so there is no verdict for this commit.
           **That is not the same as a clean bill of health** — a review that ran
-          and found nothing says so explicitly ("✅ GLM review: no defects
+          and found nothing says so explicitly ("✅ Third Party Review: no defects
           found.").
 
           Reason: $reason.
