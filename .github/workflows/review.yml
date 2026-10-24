@@ -1,16 +1,25 @@
 name: GLM PR Review
 
-# Reusable CodeRabbit-style bug-hunting PR reviewer powered by the z.ai GLM
-# coding plan through the claude-code-action harness. Callers provide the
-# pull_request trigger, size gate, and ZHIPU_API_KEY secret — see README.md.
+# Reusable CodeRabbit-style bug-hunting PR reviewer run through the
+# claude-code-action harness against any Anthropic-compatible endpoint — the
+# z.ai GLM coding plan by default. Callers provide the pull_request trigger,
+# size gate, and MODEL_API_KEY secret — see README.md.
 
 on:
   workflow_call:
     inputs:
       model:
-        description: GLM model id on the z.ai Anthropic-compatible endpoint
+        description: Model id on the `base_url` endpoint
         type: string
         default: glm-5.2
+      base_url:
+        description: >-
+          Anthropic-compatible Messages API endpoint the model is served from.
+          Defaults to the z.ai GLM coding plan; any provider that speaks the
+          Anthropic API works (e.g. Moonshot's Kimi endpoint). OpenAI-only
+          providers need a translating proxy in front.
+        type: string
+        default: https://api.z.ai/api/anthropic
       extra_instructions:
         description: Repo-specific review instructions appended to the base prompt
         type: string
@@ -39,9 +48,15 @@ on:
           deliberately, read the failing run, turn it back off.
         type: boolean
         default: false
+    # Both optional, because GitHub has no "one of" for secrets: MODEL_API_KEY
+    # is the provider-neutral name, ZHIPU_API_KEY keeps callers written before
+    # it working. The "Check the model API key" step restores the guarantee
+    # `required: true` used to give.
     secrets:
+      MODEL_API_KEY:
+        required: false
       ZHIPU_API_KEY:
-        required: true
+        required: false
 
 concurrency:
   group: glm-review-${{ github.event.pull_request.number || github.ref }}
@@ -92,7 +107,22 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: GLM bug-hunting review
+      # Neither secret is required (see `secrets:` above), so an empty key would
+      # otherwise reach the action and fail as an opaque auth error — or, for a
+      # Dependabot-triggered run, an empty secret store. Fail here instead, with
+      # a reason the notice below can name.
+      - name: Check the model API key
+        id: key
+        env:
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY || secrets.ZHIPU_API_KEY }}
+        shell: bash
+        run: |
+          if [ -z "${MODEL_API_KEY:-}" ]; then
+            echo "::error title=No model API key::Pass the provider's key as the MODEL_API_KEY secret (ZHIPU_API_KEY is still accepted)."
+            exit 1
+          fi
+
+      - name: Bug-hunting review
         id: review
         # Shorter than the job timeout on purpose: a step timeout marks the step
         # failed and lets the rest of the job run, so the failure notice below
@@ -104,8 +134,13 @@ jobs:
         timeout-minutes: 35
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1
         env:
-          ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ZHIPU_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ inputs.base_url }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.MODEL_API_KEY || secrets.ZHIPU_API_KEY }}
+          # Claude Code sends background calls (titles, summaries) to a Claude
+          # "haiku" model id regardless of --model. z.ai maps that id itself;
+          # other endpoints reject it, so pin those calls to the review model.
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ inputs.model }}
+          ANTHROPIC_SMALL_FAST_MODEL: ${{ inputs.model }}
           # Must stay BELOW the step timeout, or it can never fire. At the
           # previous 3000000 (50 minutes) the SDK's own per-request timeout sat
           # above both the step clock (35m) and the job clock (40m), so a request
@@ -127,7 +162,7 @@ jobs:
           # model — it is a stuck one.
           API_TIMEOUT_MS: "1200000"
         with:
-          anthropic_api_key: ${{ secrets.ZHIPU_API_KEY }}
+          anthropic_api_key: ${{ secrets.MODEL_API_KEY || secrets.ZHIPU_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           track_progress: true
           show_full_output: ${{ inputs.debug_full_output }}
@@ -279,6 +314,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
           OUTCOME: ${{ steps.review.outcome }}
+          KEY_OUTCOME: ${{ steps.key.outcome }}
           PROVIDER_ERROR: ${{ steps.verdict.outputs.provider_error }}
           PROVIDER_MESSAGE: ${{ steps.verdict.outputs.provider_message }}
         shell: bash
@@ -311,7 +347,9 @@ jobs:
           # with "cancelled before the agent finished", which is false and
           # discards the finding. An empty subtype IS the "loop never returned"
           # case, so requiring it keeps this branch to the runs it describes.
-          if [ "${PROVIDER_ERROR:-false}" = "true" ]; then
+          if [ "${KEY_OUTCOME:-}" = "failure" ]; then
+            reason="no model API key reached the workflow, so nothing was reviewed. Pass the provider's key as the \`MODEL_API_KEY\` secret in the job that calls this workflow (\`ZHIPU_API_KEY\` is still accepted). Dependabot-triggered runs read a separate secret store, which is why the caller templates skip bot PRs"
+          elif [ "${PROVIDER_ERROR:-false}" = "true" ]; then
             reason="the model provider rejected the request, so nothing was reviewed (it reported \`${PROVIDER_MESSAGE}\`). A quota or credential problem on the provider side, not a finding about this PR: re-run the job once it is resolved"
           elif [ "$OUTCOME" = "cancelled" ] && [ -z "$subtype" ]; then
             reason="the run was cancelled before the agent finished — usually a newer push superseding it, since this workflow cancels in-progress runs for the same pull request. Nothing is wrong with the review itself: the newest commit is reviewed by its own run, which posts its verdict as a separate comment. This notice is not replaced by that run and can be disregarded once it appears"
@@ -349,7 +387,7 @@ jobs:
           notice="${RUNNER_TEMP:-.}/glm-review-notice.md"
           {
             cat <<EOF
-          ### ⚠️ GLM review did not complete
+          ### ⚠️ Third Party Review did not complete
 
           This run did not finish, so there is no verdict for this commit.
           **That is not the same as a clean bill of health** — a review that ran
@@ -379,7 +417,7 @@ jobs:
             # repo's README ships it verbatim), and matching mid-body would drop
             # exactly the verdict the fold exists to keep. A notice from an
             # earlier attempt on this run always *starts* with the line.
-            if [ -n "$prior" ] && [ "$(printf '%s' "$prior" | head -n 1)" != '### ⚠️ GLM review did not complete' ]; then
+            if [ -n "$prior" ] && [ "$(printf '%s' "$prior" | head -n 1)" != '### ⚠️ Third Party Review did not complete' ]; then
               printf '\n<details><summary>What this comment held when the run stopped</summary>\n\n%s\n\n</details>\n' "$prior"
             fi
           } > "$notice"

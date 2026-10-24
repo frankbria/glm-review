@@ -44,4 +44,4 @@ jobs:
       contents: read
       pull-requests: write
     secrets:
-      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+      MODEL_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
