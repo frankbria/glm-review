@@ -12,7 +12,7 @@ jobs:
     # not a User and fails the step to say so, painting a PR red that was never
     # reviewed. Its `allowed_bots` input would not help — GitHub runs
     # Dependabot-triggered pull_request workflows with a read-only token and the
-    # separate Dependabot secret store, so ZHIPU_API_KEY would arrive empty.
+    # separate Dependabot secret store, so MODEL_API_KEY would arrive empty.
     # `user.type` covers every bot rather than naming one.
     #
     # Both `user` and `sender` are tested, because they are different accounts
@@ -36,4 +36,4 @@ jobs:
       contents: read
       pull-requests: write
     secrets:
-      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+      MODEL_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
