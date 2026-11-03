@@ -106,7 +106,7 @@ Kimi and GLM post **inline comments on the exact defective lines** with severity
 |-------|---------|---------|
 | `model` | `glm-5.2` | Model id on the `base_url` endpoint (the last reviewer) |
 | `base_url` | `https://api.z.ai/api/anthropic` | Anthropic-compatible Messages API endpoint the last reviewer's model is served from |
-| `kimi_model` | `kimi-for-coding` | Kimi model id on the Kimi Code Anthropic-compatible endpoint |
+| `kimi_model` | `k3[1m]` | Kimi model id on the Kimi Code Anthropic-compatible endpoint |
 | `codex_model` | *(empty)* | Codex model id; empty uses Codex's default |
 | `extra_instructions` | *(empty)* | Repo-specific review instructions appended to the base prompt |
 | `upload_transcript` | `true` | Keep the agent's turn-by-turn execution log as a 14-day workflow artifact |

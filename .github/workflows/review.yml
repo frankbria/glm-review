@@ -25,7 +25,7 @@ on:
       kimi_model:
         description: Kimi model id on the Kimi Code Anthropic-compatible endpoint
         type: string
-        default: kimi-for-coding
+        default: k3[1m]
       codex_model:
         description: Codex model id; empty uses Codex's default
         type: string
@@ -330,7 +330,7 @@ jobs:
         timeout-minutes: 35
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1
         env:
-          ANTHROPIC_BASE_URL: https://api.kimi.ai/coding/
+          ANTHROPIC_BASE_URL: https://api.kimi.com/coding/
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.KIMI_API_KEY }}
           # Background "haiku" calls must use a model id the endpoint has.
           ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ inputs.kimi_model }}
@@ -709,10 +709,10 @@ jobs:
               -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' \
               -d "{\"model\":\"$3\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ok\"}]}" || true
           }
-          if [ "$KIMI_FAILED" = true ] && [ "$(probe https://api.kimi.ai/coding "$KIMI_API_KEY" "$KIMI_MODEL")" = 429 ]; then
+          if [ "$KIMI_FAILED" = true ] && [ "$(probe https://api.kimi.com/coding "$KIMI_API_KEY" "${KIMI_MODEL%\[*}")" = 429 ]; then
             echo "kimi=true" >> "$GITHUB_OUTPUT"
           fi
-          if [ "$GLM_FAILED" = true ] && [ "$(probe "${BASE_URL%/}" "$MODEL_API_KEY" "$GLM_MODEL")" = 429 ]; then
+          if [ "$GLM_FAILED" = true ] && [ "$(probe "${BASE_URL%/}" "$MODEL_API_KEY" "${GLM_MODEL%\[*}")" = 429 ]; then
             echo "glm=true" >> "$GITHUB_OUTPUT"
           fi
 
