@@ -17,7 +17,7 @@ Kimi and GLM post **inline comments on the exact defective lines** with severity
    ```sh
    gh secret set OPENAI_API_KEY --repo <owner>/<repo>
    gh secret set KIMI_API_KEY --repo <owner>/<repo>
-   gh secret set MODEL_API_KEY --repo <owner>/<repo>   # z.ai key, or another provider's
+   gh secret set ZHIPU_API_KEY --repo <owner>/<repo>   # z.ai key; the caller below forwards it as MODEL_API_KEY
    ```
 
 2. Add `.github/workflows/glm-review.yml`:
