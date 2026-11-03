@@ -46,7 +46,7 @@ REAL_VERDICT = {
 
 def _verdict_step_script() -> str:
     workflow = yaml.safe_load(REVIEW_YML.read_text())
-    steps = workflow["jobs"]["review"]["steps"]
+    steps = workflow["jobs"]["fallback"]["steps"]
     [step] = [s for s in steps if s.get("id") == "verdict"]
     return step["run"]
 
@@ -104,19 +104,34 @@ class VerdictStepTest(unittest.TestCase):
 
 
 class WiringTest(unittest.TestCase):
-    """The verdict must reach the notice and the check status."""
+    """The verdict must reach the notice and the failover report, not the check status."""
 
     def setUp(self):
-        self.steps = yaml.safe_load(REVIEW_YML.read_text())["jobs"]["review"]["steps"]
+        self.steps = yaml.safe_load(REVIEW_YML.read_text())["jobs"]["fallback"]["steps"]
 
     def test_the_incomplete_review_notice_fires_on_a_provider_error(self):
         [notice] = [s for s in self.steps if s.get("name") == "Report an incomplete review"]
         self.assertIn("steps.verdict.outputs.provider_error == 'true'", notice["if"])
 
-    def test_a_provider_error_fails_the_check(self):
-        [fail] = [s for s in self.steps if s.get("name") == "Fail the check on a provider error"]
-        self.assertIn("steps.verdict.outputs.provider_error == 'true'", fail["if"])
-        self.assertIn("exit 1", fail["run"])
+    def test_a_provider_error_is_reported_without_failing_the_check(self):
+        # Failover replaced the red check: the PR comment carries the failure.
+        self.assertFalse(any("exit 1" in s.get("run", "") and "provider_error" in s.get("if", "")
+                             for s in self.steps))
+        [report] = [s for s in self.steps if s.get("name") == "Report reviewer failover"]
+        self.assertIn("steps.verdict.outputs.provider_message", report["env"]["GLM_PROVIDER_MESSAGE"])
+        self.assertIn("steps.kimi_verdict.outputs.provider_message", report["env"]["KIMI_PROVIDER_MESSAGE"])
+
+    def test_kimi_is_read_before_the_last_reviewer_overwrites_its_file(self):
+        ids = [s.get("id") for s in self.steps]
+        self.assertLess(ids.index("kimi_verdict"), ids.index("review"))
+        names = [s.get("name") for s in self.steps]
+        self.assertLess(names.index("Upload Kimi review transcript"), ids.index("review"))
+
+    def test_kimi_gets_the_same_verdict_check(self):
+        [kimi] = [s for s in self.steps if s.get("id") == "kimi_verdict"]
+        [last] = [s for s in self.steps if s.get("id") == "verdict"]
+        self.assertEqual(kimi["run"], last["run"])
+        self.assertEqual(kimi["env"]["EXECUTION_FILE"], "${{ steps.kimi.outputs.execution_file }}")
 
 
 if __name__ == "__main__":

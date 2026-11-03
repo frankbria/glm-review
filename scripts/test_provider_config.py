@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Tests for review.yml's provider configuration.
 
-The reviewer runs against any Anthropic-compatible endpoint: `base_url` and
-`model` choose it, and the key arrives as MODEL_API_KEY or, from callers written
-before that name existed, ZHIPU_API_KEY. Neither secret can be `required`, so the
-"Check the model API key" step stands in for that guarantee, and these tests run
-its shell script as extracted from review.yml.
+The last reviewer in the failover chain runs against any Anthropic-compatible
+endpoint: `base_url` and `model` choose it, and the key arrives as MODEL_API_KEY
+or, from callers written before that name existed, ZHIPU_API_KEY. Every secret is
+optional: a missing key skips that reviewer and the failover report says so.
 
 Run: python3 -m unittest discover -s scripts -p 'test_*.py'
 """
@@ -27,28 +26,31 @@ def _workflow() -> dict:
     return yaml.safe_load(REVIEW_YML.read_text())
 
 
-def _step(**match) -> dict:
-    steps = _workflow()["jobs"]["review"]["steps"]
+def _step(job: str = "fallback", **match) -> dict:
+    steps = _workflow()["jobs"][job]["steps"]
     [step] = [s for s in steps if all(s.get(k) == v for k, v in match.items())]
     return step
 
 
-class KeyCheckTest(unittest.TestCase):
-    def _run(self, key: str) -> int:
-        env = {**os.environ, "MODEL_API_KEY": key}
-        return subprocess.run(
-            ["bash", "-c", _step(id="key")["run"]], env=env, capture_output=True
-        ).returncode
+class PromptTest(unittest.TestCase):
+    def _compose(self) -> str:
+        with __import__("tempfile").TemporaryDirectory() as tmp:
+            output = Path(tmp) / "out"
+            output.touch()
+            env = {**os.environ, "GITHUB_OUTPUT": str(output), "GITHUB_REPOSITORY": "o/r",
+                   "PR_NUMBER": "1", "RUNNER_TEMP": tmp, "EXTRA_INSTRUCTIONS": "",
+                   "KIMI_MODEL": "kimi-x", "MODEL": "glm-x", "CODEX_MODEL": "codex-x"}
+            subprocess.run(["bash", "-c", _step(job="review", id="prompts")["run"]], env=env, check=True)
+            return output.read_text()
 
-    def test_an_empty_key_fails(self):
-        self.assertNotEqual(self._run(""), 0)
-
-    def test_a_key_passes(self):
-        self.assertEqual(self._run("sk-test"), 0)
-
-    def test_it_runs_before_the_review(self):
-        ids = [s.get("id") for s in _workflow()["jobs"]["review"]["steps"]]
-        self.assertLess(ids.index("key"), ids.index("review"))
+    def test_each_claude_prompt_names_its_reviewer_and_model(self):
+        prompts = self._compose()
+        self.assertIn("`### Third Party Review — Kimi`", prompts)
+        self.assertIn("`Model: kimi-x`", prompts)
+        self.assertIn("`### Third Party Review — glm-x`", prompts)
+        self.assertIn("`Model: glm-x`", prompts)
+        self.assertNotIn("__MODEL__", prompts)
+        self.assertNotIn("__REVIEWER__", prompts)
 
 
 class WiringTest(unittest.TestCase):
@@ -58,7 +60,11 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(secrets["ZHIPU_API_KEY"], {"required": False})
 
     def test_every_key_consumer_takes_either_secret(self):
-        self.assertEqual(_step(id="key")["env"]["MODEL_API_KEY"], KEY_EXPR)
+        self.assertEqual(
+            _workflow()["jobs"]["fallback"]["env"]["HAS_MODEL_KEY"],
+            "${{ (secrets.MODEL_API_KEY || secrets.ZHIPU_API_KEY) != '' }}",
+        )
+        self.assertEqual(_step(id="quota")["env"]["MODEL_API_KEY"], KEY_EXPR)
         review = _step(id="review")
         self.assertEqual(review["env"]["ANTHROPIC_AUTH_TOKEN"], KEY_EXPR)
         self.assertEqual(review["with"]["anthropic_api_key"], KEY_EXPR)
@@ -72,18 +78,16 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "${{ inputs.model }}")
         self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "${{ inputs.model }}")
 
+    def test_both_kimi_and_the_last_reviewer_pin_background_calls(self):
+        env = _step(id="kimi")["env"]
+        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "${{ inputs.kimi_model }}")
+        self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "${{ inputs.kimi_model }}")
+
     def test_both_comments_record_the_model(self):
-        # Filled in by Actions, not recalled by the model, so the line cannot be wrong.
-        self.assertIn("`Model: ${{ inputs.model }}`", _step(id="review")["with"]["prompt"])
+        self.assertEqual(_step(id="review")["with"]["prompt"], "${{ needs.review.outputs.glm_prompt }}")
         notice = _step(name="Report an incomplete review")
         self.assertEqual(notice["env"]["MODEL"], "${{ inputs.model }}")
         self.assertIn("Model: \\`$MODEL\\`", notice["run"])
-
-    def test_a_missing_key_is_named_in_the_notice_not_blamed_on_a_timeout(self):
-        notice = _step(name="Report an incomplete review")
-        self.assertEqual(notice["env"]["KEY_OUTCOME"], "${{ steps.key.outcome }}")
-        run = notice["run"]
-        self.assertLess(run.index('"${KEY_OUTCOME:-}" = "failure"'), run.index("PROVIDER_ERROR:-false"))
 
 
 if __name__ == "__main__":

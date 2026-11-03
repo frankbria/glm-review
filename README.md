@@ -1,15 +1,23 @@
 # glm-review
 
-CodeRabbit-style bug-hunting PR reviewer run through the [claude-code-action](https://github.com/anthropics/claude-code-action) harness against any Anthropic-compatible model endpoint. It defaults to the [z.ai GLM coding plan](https://docs.z.ai/scenario-example/develop-tools/claude) (GLM-5.2); see [Using another provider](#using-another-provider) for Kimi and others.
+CodeRabbit-style bug-hunting PR reviewer with automatic failover across three model families:
 
-It posts **inline comments on the exact defective lines** with severity tags, concrete failure scenarios, and committable ` ```suggestion ` blocks — plus one summary comment per review. It reports only confirmed defects (bugs, security, data loss, races); style/architecture/test-coverage review is deliberately out of scope so it composes with a general-purpose reviewer.
+1. **Codex** via [openai/codex-action](https://github.com/openai/codex-action) (`OPENAI_API_KEY`, pay-per-token) — posts one summary comment with a findings table.
+2. **Kimi** via [claude-code-action](https://github.com/anthropics/claude-code-action) on the Kimi Code Anthropic-compatible endpoint (`KIMI_API_KEY`).
+3. **Any Anthropic-compatible endpoint**, by default Z.ai GLM via claude-code-action on the [z.ai GLM coding plan](https://docs.z.ai/scenario-example/develop-tools/claude) (`MODEL_API_KEY`; `ZHIPU_API_KEY` still accepted). See [Using another provider](#using-another-provider).
+
+The first reviewer that produces a review wins. A reviewer whose secret is not set is skipped. A reviewer that fails on **quota** hands over quietly (noted in the job summary); a reviewer that fails for **any other reason** hands over too, and a "Reviewer failover" comment on the PR names it so someone investigates. Reviewer failures never turn the check red — the comments carry them. CI runs are stateless, so quota is rediscovered each run; a quota failure returns in seconds.
+
+Kimi and GLM post **inline comments on the exact defective lines** with severity tags, concrete failure scenarios, and committable ` ```suggestion ` blocks — plus one summary comment per review. It reports only confirmed defects (bugs, security, data loss, races); style/architecture/test-coverage review is deliberately out of scope so it composes with a general-purpose reviewer.
 
 ## Install in a repo
 
-1. Set the secret (once per repo):
+1. Set the secrets you have (once per repo; any subset works):
 
    ```sh
-   gh secret set ZHIPU_API_KEY --repo <owner>/<repo>
+   gh secret set OPENAI_API_KEY --repo <owner>/<repo>
+   gh secret set KIMI_API_KEY --repo <owner>/<repo>
+   gh secret set ZHIPU_API_KEY --repo <owner>/<repo>   # z.ai key; the caller below forwards it as MODEL_API_KEY
    ```
 
 2. Add `.github/workflows/glm-review.yml`:
@@ -37,13 +45,17 @@ It posts **inline comments on the exact defective lines** with severity tags, co
        permissions:
          contents: read
          pull-requests: write
+       # Reviewers run in this order; set any subset. A missing one is skipped.
        secrets:
+         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+         KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
          MODEL_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
    ```
 
    > Callers written before `MODEL_API_KEY` existed pass `ZHIPU_API_KEY:` instead.
-   > That still works: the workflow accepts either name and fails the check, with
-   > a notice, when neither one arrives.
+   > That still works: the workflow accepts either name. With neither (and no
+   > other reviewer's key) a "Reviewer failover" comment says no reviewer ran;
+   > the check itself stays green.
 
    > **Those two permissions are the whole set — but only on `@main` or a pin at
    > `5003ffb` or newer.** Neither `id-token: write` nor `issues: write` is
@@ -92,8 +104,10 @@ It posts **inline comments on the exact defective lines** with severity tags, co
 
 | Input | Default | Purpose |
 |-------|---------|---------|
-| `model` | `glm-5.2` | Model id on the `base_url` endpoint |
-| `base_url` | `https://api.z.ai/api/anthropic` | Anthropic-compatible Messages API endpoint the model is served from |
+| `model` | `glm-5.2` | Model id on the `base_url` endpoint (the last reviewer) |
+| `base_url` | `https://api.z.ai/api/anthropic` | Anthropic-compatible Messages API endpoint the last reviewer's model is served from |
+| `kimi_model` | `k3[1m]` | Kimi model id on the Kimi Code Anthropic-compatible endpoint |
+| `codex_model` | *(empty)* | Codex model id; empty uses Codex's default |
 | `extra_instructions` | *(empty)* | Repo-specific review instructions appended to the base prompt |
 | `upload_transcript` | `true` | Keep the agent's turn-by-turn execution log as a 14-day workflow artifact |
 | `debug_full_output` | `false` | Log every SDK message to the workflow log — the only evidence channel that survives a step timeout |
@@ -103,7 +117,10 @@ It posts **inline comments on the exact defective lines** with severity tags, co
        with:
          extra_instructions: |
            This repo is a FastAPI service; pay extra attention to async misuse.
+       # Reviewers run in this order; set any subset. A missing one is skipped.
        secrets:
+         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+         KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
          MODEL_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
 ```
 
@@ -225,7 +242,7 @@ checker that only ever passes on correct input proves nothing.
 - `review.yml` runs `anthropics/claude-code-action` with `ANTHROPIC_BASE_URL` set to the `base_url` input (default `https://api.z.ai/api/anthropic`), so all usage bills to that provider. There are no Anthropic charges unless you point it at Anthropic. Claude Code's background calls to a "haiku" model id are pinned to `model` as well (`ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`), because non-Anthropic endpoints reject that id.
 - Inline comments use the action's built-in `github_inline_comment` MCP tool; the model is restricted to read-only `gh pr` commands otherwise. `--allowedTools` is *additive* to the action's own defaults rather than a replacement for them, so the write verbs it silently re-adds (`Write`, `Edit`, `git add|commit|rm`) are denied explicitly via `--disallowedTools`.
 - Each run uploads its execution transcript as a workflow artifact (`glm-review-transcript-<run>`, 14-day retention). The workflow log records tool calls but not model turns, so this is the only record of *why* a review said what it said. The artifact inherits the calling repo's visibility and contains the PR diff plus any file the reviewer opened — set `upload_transcript: false` where that is not acceptable.
-- Four limits bound a review, and they nest deliberately: a 20-minute per-request `API_TIMEOUT_MS` < a 35-minute timeout on the review *step* < a 40-minute job timeout, with `--max-turns 60` inside all of them. Each inner limit exists so the outer one never has to fire, because each outer limit destroys more evidence than the one inside it. The turn cap is the one meant to bind — turns cost roughly 22s each, and measured 60-turn reviews on this repo ran 14m10s and 25m13s, so the step clock sits above the spread rather than beside it. The clock is on the step, not the job, on purpose: a job-level timeout cancels every remaining step, `if: always()` included, so nothing downstream of it could report what happened.
+- Four limits bound a review, and they nest deliberately: a 20-minute per-request `API_TIMEOUT_MS` < a 35-minute timeout on the review *step* < an 80-minute job timeout (Kimi and Z.ai can both run in one job), with `--max-turns 60` inside all of them. Each inner limit exists so the outer one never has to fire, because each outer limit destroys more evidence than the one inside it. The turn cap is the one meant to bind — turns cost roughly 22s each, and measured 60-turn reviews on this repo ran 14m10s and 25m13s, so the step clock sits above the spread rather than beside it. The clock is on the step, not the job, on purpose: a job-level timeout cancels every remaining step, `if: always()` included, so nothing downstream of it could report what happened.
 - The transcript covers a review that *errored*, not one that was *killed*. `claude-code-action` writes the execution file only after its message loop returns, so a step timeout produces no artifact — and by default the workflow log carries only the `init` and `result` messages, so a timed-out run leaves no evidence of where the time went at all. Two things address that: `API_TIMEOUT_MS` is held below the step timeout so a stuck request fails as an error (which does write a transcript) rather than as a wall-clock kill, and `debug_full_output: true` streams every message to the workflow log, which is written incrementally and survives the kill.
 - A review that does not finish rewrites its own tracking comment into an explicit **"Third Party Review did not complete"** notice naming the reason (missing API key, turn cap, step timeout, mid-run error, or a provider rejection such as a 429 quota error). The "in progress" stub is never the final state, so *no review* can never be mistaken for *no defects found*. Whatever the comment already held is folded into a collapsed block rather than discarded: a run can post findings and *then* be killed, and nothing in the step outcome distinguishes that from an untouched stub.
 - A **provider rejection fails the check.** When the model API refuses the request (quota, credentials), the agent's result is `subtype: success` with `is_error: true` after one turn, so the review step itself succeeds. The workflow reads that verdict from the execution file, posts the notice with the provider's own message, and fails the job, so a run that reviewed nothing can never show as a green check.
