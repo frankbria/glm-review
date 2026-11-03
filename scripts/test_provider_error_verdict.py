@@ -121,6 +121,12 @@ class WiringTest(unittest.TestCase):
         self.assertIn("steps.verdict.outputs.provider_message", report["env"]["GLM_PROVIDER_MESSAGE"])
         self.assertIn("steps.kimi_verdict.outputs.provider_message", report["env"]["KIMI_PROVIDER_MESSAGE"])
 
+    def test_kimi_is_read_before_the_last_reviewer_overwrites_its_file(self):
+        ids = [s.get("id") for s in self.steps]
+        self.assertLess(ids.index("kimi_verdict"), ids.index("review"))
+        names = [s.get("name") for s in self.steps]
+        self.assertLess(names.index("Upload Kimi review transcript"), ids.index("review"))
+
     def test_kimi_gets_the_same_verdict_check(self):
         [kimi] = [s for s in self.steps if s.get("id") == "kimi_verdict"]
         [last] = [s for s in self.steps if s.get("id") == "verdict"]

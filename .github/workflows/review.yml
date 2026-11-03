@@ -347,6 +347,41 @@ jobs:
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
             --disallowedTools "WebSearch,WebFetch,Write,Edit,NotebookEdit,Bash(git add:*),Bash(git commit:*),Bash(git rm:*)"
 
+      # Read before the last reviewer starts: both write the same execution file
+      # path, so the last reviewer would overwrite Kimi's. Same check as the
+      # last reviewer's "Read the agent's verdict"; see its comment.
+      - name: Read Kimi's verdict
+        id: kimi_verdict
+        if: always()
+        env:
+          EXECUTION_FILE: ${{ steps.kimi.outputs.execution_file }}
+        shell: bash
+        run: |
+          provider_error=false
+          message=""
+          if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+            result="$(jq -cs 'flatten | map(select(.type == "result")) | last // {}' "$EXECUTION_FILE" 2>/dev/null || echo '{}')"
+            if [ "$(printf '%s' "$result" | jq -r '.is_error // false')" = "true" ]; then
+              provider_error=true
+              message="$(printf '%s' "$result" | jq -r '.result // "no message"' | head -c 500)"
+            fi
+          fi
+          echo "provider_error=$provider_error" >> "$GITHUB_OUTPUT"
+          {
+            echo "provider_message<<GLM_REVIEW_EOF"
+            echo "$message"
+            echo "GLM_REVIEW_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload Kimi review transcript
+        if: always() && inputs.upload_transcript && steps.kimi.outputs.execution_file != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-review-transcript-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.kimi.outputs.execution_file }}
+          if-no-files-found: ignore
+          retention-days: 14
+
       # A successful agent session is not proof of a review (issue #3): require
       # Kimi's own summary comment (its required heading) before skipping Z.ai.
       # continue-on-error so an API hiccup here falls through to Z.ai.
@@ -365,6 +400,11 @@ jobs:
             | jq -s --arg since "$SINCE" 'flatten | map(select(.user.type == "Bot" and .created_at >= $since and (.body | startswith("### Third Party Review — Kimi")))) | length')"
           echo "Kimi summary comments since $SINCE: $count"
           if [ "$count" -gt 0 ]; then echo "posted=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Note when the last review started
+        id: review_start
+        if: ${{ !cancelled() && env.HAS_MODEL_KEY == 'true' && steps.kimi_posted.outputs.posted != 'true' }}
+        run: echo "since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Bug-hunting review
         id: review
@@ -454,30 +494,6 @@ jobs:
       # `always()` on purpose: the run that motivated this reported success.
       # Failures need the transcript too, so this must not be conditioned on the
       # review step's outcome.
-      # Same check for Kimi; see the next step's comment.
-      - name: Read Kimi's verdict
-        id: kimi_verdict
-        if: always()
-        env:
-          EXECUTION_FILE: ${{ steps.kimi.outputs.execution_file }}
-        shell: bash
-        run: |
-          provider_error=false
-          message=""
-          if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
-            result="$(jq -cs 'flatten | map(select(.type == "result")) | last // {}' "$EXECUTION_FILE" 2>/dev/null || echo '{}')"
-            if [ "$(printf '%s' "$result" | jq -r '.is_error // false')" = "true" ]; then
-              provider_error=true
-              message="$(printf '%s' "$result" | jq -r '.result // "no message"' | head -c 500)"
-            fi
-          fi
-          echo "provider_error=$provider_error" >> "$GITHUB_OUTPUT"
-          {
-            echo "provider_message<<GLM_REVIEW_EOF"
-            echo "$message"
-            echo "GLM_REVIEW_EOF"
-          } >> "$GITHUB_OUTPUT"
-
       # The step outcome cannot tell a review from a provider rejection: when the
       # model API refuses the request (a 429 quota error, an auth failure), the
       # agent's result message is `subtype: success` with `is_error: true` after a
@@ -510,14 +526,23 @@ jobs:
             echo "GLM_REVIEW_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Upload Kimi review transcript
-        if: always() && inputs.upload_transcript && steps.kimi.outputs.execution_file != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: kimi-review-transcript-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.kimi.outputs.execution_file }}
-          if-no-files-found: ignore
-          retention-days: 14
+      # Same proof-of-review as Kimi's: its own summary comment, by heading.
+      - name: Confirm the last reviewer posted a review
+        id: review_posted
+        if: steps.review.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.review_start.outputs.since }}
+          HEADING: "### Third Party Review — ${{ inputs.model }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          count="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            | jq -s --arg since "$SINCE" --arg heading "$HEADING" 'flatten | map(select(.user.type == "Bot" and .updated_at >= $since and (.body | contains($heading)))) | length')"
+          echo "Summary comments since $SINCE: $count"
+          if [ "$count" -gt 0 ]; then echo "posted=true" >> "$GITHUB_OUTPUT"; fi
 
       - name: Upload review transcript
         if: always() && inputs.upload_transcript && steps.review.outputs.execution_file != ''
@@ -705,7 +730,7 @@ jobs:
           KIMI_OUTCOME: ${{ steps.kimi.outcome == 'success' && steps.kimi_posted.outputs.posted != 'true' && 'no-review' || steps.kimi.outcome }}
           KIMI_QUOTA: ${{ steps.quota.outputs.kimi }}
           KIMI_PROVIDER_MESSAGE: ${{ steps.kimi_verdict.outputs.provider_error == 'true' && steps.kimi_verdict.outputs.provider_message || '' }}
-          GLM_OUTCOME: ${{ steps.review.outcome }}
+          GLM_OUTCOME: ${{ steps.review.outcome == 'success' && steps.review_posted.outputs.posted != 'true' && 'no-review' || steps.review.outcome }}
           GLM_QUOTA: ${{ steps.quota.outputs.glm }}
           GLM_MODEL: ${{ inputs.model }}
           GLM_PROVIDER_MESSAGE: ${{ steps.verdict.outputs.provider_error == 'true' && steps.verdict.outputs.provider_message || '' }}
