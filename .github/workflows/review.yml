@@ -81,7 +81,9 @@ jobs:
   # strategy removes sudo for the rest of the host irreversibly; the Kimi/Z.ai
   # steps must not share that host.
   review:
-    runs-on: ubuntu-latest
+    # shortcut: drop-sudo fails on ubuntu-latest (26.04) with "Could not restrict access to
+    # /run/dbus/system_bus_socket" (openai/codex-action#188); unpin once a codex-action release fixes it.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
