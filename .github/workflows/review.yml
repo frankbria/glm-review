@@ -200,12 +200,17 @@ jobs:
 
       # Codex runs without network or GitHub credentials, so it gets the diff as
       # a file instead of calling `gh`.
+      #
+      # --allow-escape-sequences: `gh` refuses to print a diff holding a terminal
+      # escape sequence, to protect a terminal. This one goes to a file, and a
+      # refusal fails the step and so the whole Codex review (frankbria/iris#644:
+      # a raw ESC byte in a test's regex, within three lines of a change).
       - name: Fetch the PR diff
         if: env.HAS_OPENAI_KEY == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/pr.diff"
+        run: gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --allow-escape-sequences > "$RUNNER_TEMP/pr.diff"
 
       - name: Codex bug-hunting review
         id: codex
